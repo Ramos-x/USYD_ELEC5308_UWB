@@ -3303,7 +3303,7 @@ void dwt_isr(void) {
         //AES_ERR, BRNOUT, PLLHILO not handled here ...
     }
 
-    // Handle TX frme sent confirmation event
+    // Handle TX frme sent confirmation event                   TX 完成事件
     if (fstat & FINT_STAT_TXOK_BIT_MASK) {
         // Clear TX events after the callback - this lets the host schedule another TX/RX inside the callback
         dwt_write8bitoffsetreg(SYS_STATUS_ID, 0, (uint8_t) SYS_STATUS_ALL_TX);
@@ -3316,7 +3316,7 @@ void dwt_isr(void) {
     }
 
 
-    // SPI ready and IDLE_RC bit gets set when device powers on, or on wake up
+    // SPI ready and IDLE_RC bit gets set when device powers on, or on wake up          系统事件 (SPI ready / RC init)
     if (fstat & FINT_STAT_SYS_EVENT_BIT_MASK) {
         //pdw3000local->cbData.status_hi = dwt_read16bitreg(SYS_STATUS_HI_ID);
 
@@ -3333,7 +3333,7 @@ void dwt_isr(void) {
         //VTDET, GPIO, not handled here ...
     }
 
-    // Handle RX ok events
+    // Handle RX ok events                                      RX 成功事件
     if (fstat & FINT_STAT_RXOK_BIT_MASK) {
         uint32_t cia_err = 0;
 

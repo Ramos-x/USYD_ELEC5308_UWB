@@ -2,16 +2,17 @@
 #include "uwb.h"
 #include "deca_device_api.h"
 #include "main.h"
+#include "bu03.h"
 
 // ========== 可选：用户回调 ==========
 
 /**
  * @brief  TX 完成回调（由 dwt_isr 内部分发）
  * @param  cb: 驱动传入的事件信息（可为空检查）
- * @note   根据需要在此处添加发送完成后的业务逻辑
+ * @note   发送完成由DW3000内部LED(TXLED)指示，无需STM32侧GPIO操作
  */
 static void on_tx_done(const dwt_cb_data_t *cb) {
-    (void)cb;
+    (void) cb;
 }
 
 /**
@@ -24,6 +25,8 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
     uint8_t buf[128];
     if (len > sizeof(buf)) len = sizeof(buf);
     dwt_readrxdata(buf, len, 0);
+
+    /* 接收成功由DW3000内部LED(RXLED/RXOKLED)指示 */
     // TODO: 处理 buf 中的数据
 }
 
@@ -33,7 +36,7 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
  * @note   可在此处选择重启接收
  */
 static void on_rx_to(const dwt_cb_data_t *cb) {
-    (void)cb;
+    (void) cb;
     // 可按需重启接收：dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
@@ -43,7 +46,8 @@ static void on_rx_to(const dwt_cb_data_t *cb) {
  * @note   可在此处选择重启接收
  */
 static void on_rx_err(const dwt_cb_data_t *cb) {
-    (void)cb;
+    (void) cb;
+    /* 接收错误由DW3000内部LED(RXLED)指示 */
     // 可按需重启接收：dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
@@ -83,6 +87,7 @@ void reset_DWIC() {
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
     if (GPIO_Pin == DW_IRQ_Pin) {
         dwt_isr();
+        /* SFD 指示由DW3000内部LED(SFDLED)完成 */
     }
 }
 
@@ -145,6 +150,9 @@ int UWB_DW3000_Init() {
     /* 4) 完成基本配置后切换到高速 SPI（例如 ~18MHz） */
     port_set_dw_ic_spi_fastrate();
 
+    /* 启用 DW 芯片内部 LED（GPIO0~3 -> RXOK/SFD/RX/TX），并在初始化后闪烁一次 */
+    dwt_setleds(DWT_LEDS_ENABLE | DWT_LEDS_INIT_BLINK);
+
     dwt_setcallbacks(on_tx_done, on_rx_ok, on_rx_to, on_rx_err, NULL, NULL);
 
     // 使能常用中断：RXOK/RXERR/RX 超时/TX 完成/ARFE 等
@@ -179,9 +187,9 @@ void deca_usleep(unsigned long time_us) {
         DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
         dwt_inited = 1;
     }
-    uint32_t cycles = (uint32_t)((SystemCoreClock / 1000000UL) * time_us);
+    uint32_t cycles = (uint32_t) ((SystemCoreClock / 1000000UL) * time_us);
     uint32_t start = DWT->CYCCNT;
-    while ((uint32_t)(DWT->CYCCNT - start) < cycles) {
+    while ((uint32_t) (DWT->CYCCNT - start) < cycles) {
         __NOP();
     }
 }
@@ -198,8 +206,7 @@ void enable_deca_irq(void) {
 /* ======== 平台适配：SPI 速率切换 ======== */
 extern SPI_HandleTypeDef hspi1;
 
-static void spi_apply_prescaler(uint32_t prescaler)
-{
+static void spi_apply_prescaler(uint32_t prescaler) {
     /* 片选拉高，避免切速过程中误触发 */
     HAL_GPIO_WritePin(DW3000_CS_GPIO_Port, DW3000_CS_Pin, GPIO_PIN_SET);
 
@@ -209,22 +216,97 @@ static void spi_apply_prescaler(uint32_t prescaler)
 }
 
 /* 直接设置指定分频（传入 HAL 的 SPI_BAUDRATEPRESCALER_x 宏） */
-void SPI_ConfigFastRate(uint16_t scalingfactor)
-{
-    spi_apply_prescaler((uint32_t)scalingfactor);
+void SPI_ConfigFastRate(uint16_t scalingfactor) {
+    spi_apply_prescaler((uint32_t) scalingfactor);
 }
 
 /* 低速（初始化/复位/睡眠阶段，<3MHz） */
-void port_set_dw_ic_spi_slowrate(void)
-{
+void port_set_dw_ic_spi_slowrate(void) {
     /* APB2 72MHz -> 分频32 ≈ 2.25MHz */
     spi_apply_prescaler(SPI_BAUDRATEPRESCALER_32);
 }
 
 /* 高速（正常通讯，如 18MHz） */
-void port_set_dw_ic_spi_fastrate(void)
-{
-    /* APB2 72MHz -> 分频4 ≈ 18MHz */
-    spi_apply_prescaler(SPI_BAUDRATEPRESCALER_4);
+void port_set_dw_ic_spi_fastrate(void) {
+    /* APB2 72MHz -> 分频8 */
+    spi_apply_prescaler(SPI_BAUDRATEPRESCALER_8);
 }
 
+/* ====================== Tag 主动 POLL（无需发现） ====================== */
+static uint8_t s_tag_proactive_enabled = 1; /* 允许主动发 POLL */
+static uint32_t s_tag_poll_interval_ms = 1000; /* POLL 周期，默认 1000ms */
+static uint32_t s_tag_last_poll_ms = 0;
+static uint8_t s_tag_seq = 0;
+static uint16_t s_tag_pan = 0xDECA; /* PAN ID，可按需修改/统一 */
+static uint16_t s_tag_short = 0x1234; /* Tag 短地址，可按需修改/统一 */
+static const uint16_t s_broadcast_short = 0xFFFF;
+static uint8_t s_tag_addr_inited = 0;
+
+/* 组帧并立即发送 POLL（发往广播地址） */
+static void tag_proactive_try_send_poll(void) {
+    uint8_t tx[32];
+    uint8_t i = 0;
+
+    /* FCF（Data Frame，16-bit 目的+源地址） */
+    tx[i++] = 0x41;
+    tx[i++] = 0x88;
+
+    /* 序号 */
+    tx[i++] = s_tag_seq++;
+
+    /* PAN ID */
+    tx[i++] = (uint8_t) (s_tag_pan & 0xFF);
+    tx[i++] = (uint8_t) (s_tag_pan >> 8);
+
+    /* 目的：广播 */
+    tx[i++] = (uint8_t) (s_broadcast_short & 0xFF);
+    tx[i++] = (uint8_t) (s_broadcast_short >> 8);
+
+    /* 源：本 Tag 短地址 */
+    tx[i++] = (uint8_t) (s_tag_short & 0xFF);
+    tx[i++] = (uint8_t) (s_tag_short >> 8);
+
+    /* 负载：'P''O''L''L' */
+    tx[i++] = 'P';
+    tx[i++] = 'O';
+    tx[i++] = 'L';
+    tx[i++] = 'L';
+
+    uint16_t txlen = i;
+
+    if (dwt_writetxdata(txlen, tx, 0) == DWT_SUCCESS) {
+        dwt_writetxfctrl(txlen + 2, 0, 1);
+        (void) dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+        /* 发射完成后自动切换到接收；非阻塞 */
+    }
+}
+
+/* 对外周期任务：若为 Tag 角色，则按周期主动发 POLL */
+void uwb_periodic_task(void) {
+    if (!s_tag_proactive_enabled) {
+        return;
+    }
+    if (bu03_get_role() != BU03_ROLE_TAG) {
+        return;
+    }
+
+    /* 首次进入时设置地址与接收 */
+    if (!s_tag_addr_inited) {
+        dwt_setpanid(s_tag_pan);
+        dwt_setaddress16(s_tag_short);
+        dwt_setrxtimeout(0); /* 持续接收 */
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        s_tag_addr_inited = 1;
+    }
+
+    uint32_t now = HAL_GetTick();
+    if ((now - s_tag_last_poll_ms) >= s_tag_poll_interval_ms) {
+        s_tag_last_poll_ms = now;
+        tag_proactive_try_send_poll();
+    }
+
+    /* 若采用轮询中断模型，顺便驱动一次 ISR */
+    if (dwt_checkirq()) {
+        dwt_isr();
+    }
+}

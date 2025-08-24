@@ -140,4 +140,10 @@ void wakeup_device_with_io(void);
  */
 int UWB_DW3000_Init(void);
 
+/**
+ * @brief UWB 周期性任务（若为 Tag 角色则主动按周期发送 POLL）
+ *        请在主循环中定期调用
+ */
+void uwb_periodic_task(void);
+
 #endif

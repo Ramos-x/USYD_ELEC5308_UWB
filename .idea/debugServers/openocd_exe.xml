@@ -9,6 +9,6 @@
     </gdbserver>
     <console port="4444" />
     <target download-type="UPDATED_ONLY" reset-before="false" />
-    <connection extended-remote="false" remote-string="localhost:3333" custom-script="echo Connecting to target...\n&#10;$GDBTargetCommand$&#10;echo Connected to target!\n" />
+    <connection remote-string="localhost:3333" custom-script="echo Connecting to target...\n&#10;$GDBTargetCommand$&#10;echo Connected to target!\n" />
   </generic-debug-target>
 </component>

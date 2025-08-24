@@ -19,6 +19,7 @@ extern "C" {
 #endif
 
 /* 对外 API */
+void bu03_reset(void);
 int  bu03_init(void);
 void bu03_process(void);
 void bu03_set_rate_hz(float rate);

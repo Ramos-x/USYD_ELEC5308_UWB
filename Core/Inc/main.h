@@ -103,7 +103,7 @@ void Error_Handler(void);
 #define PB9_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+/* UWB的 LEDTX/LEDRX/LEDSFD/LEDRXOK 由 BU03(DW3000) 芯片 GPIO3/2/1/0 内部驱动，此处无需STM32侧映射 */
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

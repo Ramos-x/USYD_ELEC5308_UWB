@@ -1,8 +1,13 @@
 #include "app.h"
+
+#include <stdio.h>
+
 #include "OLED/oled.h"
 #include "UWB/calibration.h"
 #include "UWB/bu03.h"
 #include "UWB/uwb.h"
+#include "UWB/tag.h"
+#include "UWB/anchor.h"
 
 
 /* UI 状态管理 */
@@ -12,45 +17,54 @@ typedef enum {
 } ui_state_t;
 
 static ui_state_t s_ui_state = UI_READY;
-static uint32_t   s_anchor_count = 0;
+static uint32_t s_anchor_count = 0;
 
 /* 标签定位缓存（是否已有有效解与最近一次解算坐标） */
-static int        s_have_tag = 0;
+static int s_have_tag = 0;
 static uwb_vec3_t s_tag_pos;
 
 /* 最近一次测距结果（Tag 角色使用） */
-static uint32_t   s_last_range_ids[8];
-static float      s_last_ranges[8];
-static uint32_t   s_last_range_count = 0;
+static uint32_t s_last_range_ids[8];
+static float s_last_ranges[8];
+static uint32_t s_last_range_count = 0;
 
 /* UWB 初始化状态：0=未完成/失败，1=OK */
-static int        s_uwb_ok = 0;
+static int s_uwb_ok = 0;
 /* 启动与初始化延后状态 */
-static uint32_t   s_boot_ms = 0;
-static int        s_uwb_init_started = 0;
-static uint32_t   s_next_retry_ms = 0;
-static int        s_uwb_retry_count = 0;
+static uint32_t s_boot_ms = 0;
+static int s_uwb_init_started = 0;
+static uint32_t s_next_retry_ms = 0;
+static int s_uwb_retry_count = 0;
 
 /* ===== 工具：将整数（带符号，放大10倍）格式化为 "+12.3" 样式 ===== */
 static void fmt_signed_dec1(int v10, char out[6]) {
     /* out 长度至少 6（含 '\0'），格式：符号 1 + 整数 2 + '.' + 小数 1 */
     int neg = (v10 < 0);
     int a10 = neg ? -v10 : v10;
-    int i  = (a10 / 10) % 100; /* 限 2 位整数显示 */
-    int d  = a10 % 10;
+    int i = (a10 / 10) % 100; /* 限 2 位整数显示 */
+    int d = a10 % 10;
     out[0] = neg ? '-' : '+';
-    out[1] = (char)('0' + (i / 10));
-    out[2] = (char)('0' + (i % 10));
+    out[1] = (char) ('0' + (i / 10));
+    out[2] = (char) ('0' + (i % 10));
     out[3] = '.';
-    out[4] = (char)('0' + d);
+    out[4] = (char) ('0' + d);
     out[5] = '\0';
 }
 
 /* 头栏：显示角色与 UWB 初始化状态 */
 static void draw_header(void) {
-    if (s_uwb_ok) {
-        OLED_ShowString(0, 0, (bu03_get_role() == BU03_ROLE_ANCHOR) ? "ROLE:A" : "ROLE:T");
+    if (bu03_get_role() == BU03_ROLE_TAG) {
+        OLED_ShowString(0, 0, "ROLE:TAG");
         OLED_ShowString(64, 0, "UWB:OK");
+        char idbuf[16];
+        (void) snprintf(idbuf, sizeof(idbuf), "TAG:%04X", (unsigned) tag_get_short());
+        OLED_ShowString(64, 8, idbuf);
+    } else if (bu03_get_role() == BU03_ROLE_ANCHOR) {
+        OLED_ShowString(0, 0, "ROLE:ACR");
+        OLED_ShowString(64, 0, "UWB:OK");
+        char idbuf[16];
+        (void) snprintf(idbuf, sizeof(idbuf), "ACR:%04X", (unsigned) anchor_get_short());
+        OLED_ShowString(64, 8, idbuf);
     } else {
         OLED_ShowString(0, 0, "ROLE:-");
         OLED_ShowString(64, 0, "UWB:...");
@@ -65,92 +79,108 @@ static void ui_draw_ready(void) {
     char line[22];
     if (bu03_get_role() == BU03_ROLE_TAG) {
         /* Anchors count (Tag only) */
-        line[0]='A'; line[1]='N'; line[2]='C'; line[3]=':'; line[4]=' ';
+        line[0] = 'A';
+        line[1] = 'C';
+        line[2] = 'R';
+        line[3] = ':';
+        line[4] = ' ';
         uint32_t n = s_anchor_count;
-        char buf[10]; int bi=0;
-        if (n==0) buf[bi++]='0';
+        char buf[10];
+        int bi = 0;
+        if (n == 0) buf[bi++] = '0';
         else {
-            char tmp[10]; int ti=0; while(n && ti<10){ tmp[ti++]=(char)('0'+(n%10)); n/=10; }
-            while(ti){ buf[bi++]=tmp[--ti]; }
+            char tmp[10];
+            int ti = 0;
+            while (n && ti < 10) {
+                tmp[ti++] = (char) ('0' + (n % 10));
+                n /= 10;
+            }
+            while (ti) { buf[bi++] = tmp[--ti]; }
         }
-        int idx=5;
-        for (int k=0;k<bi && idx<(int)sizeof(line)-1;k++) line[idx++]=buf[k];
-        line[idx]='\0';
+        int idx = 5;
+        for (int k = 0; k < bi && idx < (int) sizeof(line) - 1; k++) line[idx++] = buf[k];
+        line[idx] = '\0';
         OLED_ShowString(0, 16, line);
     }
 
     if (s_have_tag) {
         char v[6];
-        int x10=(int)(s_tag_pos.x*10.0f), y10=(int)(s_tag_pos.y*10.0f), z10=(int)(s_tag_pos.z*10.0f);
+        int x10 = (int) (s_tag_pos.x * 10.0f), y10 = (int) (s_tag_pos.y * 10.0f), z10 = (int) (s_tag_pos.z * 10.0f);
 
         fmt_signed_dec1(x10, v);
-        line[0]='X'; line[1]=':'; line[2]=' '; line[3]=v[0]; line[4]=v[1]; line[5]=v[2]; line[6]=v[3]; line[7]=v[4]; line[8]='\0';
+        line[0] = 'X';
+        line[1] = ':';
+        line[2] = ' ';
+        line[3] = v[0];
+        line[4] = v[1];
+        line[5] = v[2];
+        line[6] = v[3];
+        line[7] = v[4];
+        line[8] = '\0';
         OLED_ShowString(0, 24, line);
 
         fmt_signed_dec1(y10, v);
-        line[0]='Y'; line[1]=':'; line[2]=' '; line[3]=v[0]; line[4]=v[1]; line[5]=v[2]; line[6]=v[3]; line[7]=v[4]; line[8]='\0';
+        line[0] = 'Y';
+        line[1] = ':';
+        line[2] = ' ';
+        line[3] = v[0];
+        line[4] = v[1];
+        line[5] = v[2];
+        line[6] = v[3];
+        line[7] = v[4];
+        line[8] = '\0';
         OLED_ShowString(0, 32, line);
 
         fmt_signed_dec1(z10, v);
-        line[0]='Z'; line[1]=':'; line[2]=' '; line[3]=v[0]; line[4]=v[1]; line[5]=v[2]; line[6]=v[3]; line[7]=v[4]; line[8]='\0';
+        line[0] = 'Z';
+        line[1] = ':';
+        line[2] = ' ';
+        line[3] = v[0];
+        line[4] = v[1];
+        line[5] = v[2];
+        line[6] = v[3];
+        line[7] = v[4];
+        line[8] = '\0';
         OLED_ShowString(0, 40, line);
     } else {
-        if (bu03_get_role() == BU03_ROLE_ANCHOR) {
-                    if (bu03_get_role() == BU03_ROLE_TAG) {
-                        if (s_last_range_count > 0) {
-                            /* 显示前 3 个距离，格式近似 "+12.3m"（去掉符号） */
-                            char v[6];
-                            uint32_t show = (s_last_range_count > 3) ? 3 : s_last_range_count;
-                            for (uint32_t i = 0; i < show; ++i) {
-                                int d10 = (int)(s_last_ranges[i] * 10.0f + 0.5f);
-                                fmt_signed_dec1(d10, v);
-                                /* 组行：Dn: 12.3m （去掉符号位 v[0]） */
-                                int idxl = 0;
-                                line[idxl++] = 'D';
-                                line[idxl++] = (char)('0' + (int)i);
-                                line[idxl++] = ':';
-                                line[idxl++] = ' ';
-                                line[idxl++] = v[1];
-                                line[idxl++] = v[2];
-                                line[idxl++] = v[3];
-                                line[idxl++] = v[4];
-                                line[idxl++] = 'm';
-                                line[idxl] = '\0';
-                                OLED_ShowString(0, 24 + (int)i * 8, line);
-                            }
-                            /* 如果不足 3 条，余下行不用刷新 */
-                        } else {
-                            OLED_ShowString(0, 24, "Waiting Anchors...");
-                        }
-                    } else {
-                        OLED_ShowString(0, 24, "Waiting Tag...");
-                    }
+        /* 未获得坐标解：按角色展示等待/测距信息 */
+        if (bu03_get_role() == BU03_ROLE_TAG) {
+            if (s_last_range_count > 0) {
+                /* 显示前 3 个距离，格式近似 "12.3m"（去掉符号） */
+                char v[6];
+                uint32_t show = (s_last_range_count > 3) ? 3 : s_last_range_count;
+                for (uint32_t i = 0; i < show; ++i) {
+                    int d10 = (int) (s_last_ranges[i] * 10.0f + 0.5f);
+                    fmt_signed_dec1(d10, v);
+                    /* 组行：Dn: 12.3m （去掉符号位 v[0]） */
+                    int idxl = 0;
+                    line[idxl++] = 'D';
+                    line[idxl++] = (char) ('0' + (int) i);
+                    line[idxl++] = ':';
+                    line[idxl++] = ' ';
+                    line[idxl++] = v[1];
+                    line[idxl++] = v[2];
+                    line[idxl++] = v[3];
+                    line[idxl++] = v[4];
+                    line[idxl++] = 'm';
+                    line[idxl] = '\0';
+                    OLED_ShowString(0, 24 + (int) i * 8, line);
+                }
+                /* 如果不足 3 条，余下行不用刷新 */
+            } else {
+                OLED_ShowString(0, 24, "Waiting Anchors...");
+            }
         } else {
-            OLED_ShowString(0, 24, "Waiting Anchors...");
+            /* ACR 角色 */
+            OLED_ShowString(0, 24, "Waiting Tag...");
         }
     }
     OLED_Update();
 }
 
-/* ============ 校准回调（仅在本模块内可见） ============ */
-
-/* 测距请求回调：对接 UWB 层后，应触发一次 a-b 的测距，完毕调用 uwb_calib_on_range(a,b,d) */
-static void calib_request_range_cb(uint32_t a_id, uint32_t b_id) {
-    (void)a_id; (void)b_id;
-    /* TODO: 对接底层测距流程；测得距离(米)后调用 uwb_calib_on_range(a_id, b_id, distance_m) */
-}
-
-/* 校准结果回调：就绪界面 */
-static void calib_on_positions_ready_cb(const uwb_vec3_t* positions, uint32_t count) {
-    (void)positions;
-    s_anchor_count = count;
-    s_ui_state = UI_READY;
-    ui_draw_ready();
-}
-
 
 /* ============ 面向底层的标签距离上报接口 ============ */
-void app_on_tag_ranges(uint32_t count, const uint32_t* anchor_ids, const float* distances_m) {
+void app_on_tag_ranges(uint32_t count, const uint32_t *anchor_ids, const float *distances_m) {
     if (!anchor_ids || !distances_m || count == 0) return;
 
     /* 缓存最近一次测距（最多 8 个），供 UI 展示 */
@@ -166,7 +196,7 @@ void app_on_tag_ranges(uint32_t count, const uint32_t* anchor_ids, const float* 
 
     /* 取当前已标定锚点与坐标 */
     uint32_t calib_n = 0;
-    const uwb_vec3_t* anchors = uwb_calib_get_positions(&calib_n);
+    const uwb_vec3_t *anchors = uwb_calib_get_positions(&calib_n);
     if (!anchors || calib_n < 4) return;
 
     /* 获取已标定的锚点 ID 列表，并与上报的距离进行对齐（取交集子集解算） */
@@ -208,7 +238,7 @@ void app_on_tag_ranges(uint32_t count, const uint32_t* anchor_ids, const float* 
 
 /* ============ 应用入口实现 ============ */
 
-void app_init(I2C_HandleTypeDef* i2c_for_oled) {
+void app_init(I2C_HandleTypeDef *i2c_for_oled) {
     /* OLED 初始化与欢迎信息 */
     OLED_Init(i2c_for_oled);
 
@@ -219,18 +249,17 @@ void app_init(I2C_HandleTypeDef* i2c_for_oled) {
     OLED_ShowString(0, 24, __DATE__);
     OLED_ShowString(0, 32, __TIME__);
     OLED_Update();
-    HAL_Delay(1200);
+    // HAL_Delay(1200);
 
     /* 提示 UWB 初始化 */
-    OLED_Clear();
-    OLED_ShowString(0, 0, "UWB Init...");
-    OLED_Update();
+    // OLED_Clear();
+    // OLED_ShowString(0, 0, "UWB 1");
+    // OLED_Update();
 
     s_ui_state = UI_READY;
     s_anchor_count = 0;
     s_have_tag = 0;
 
-    /* 校准模块由上层或其他途径初始化（此处不依赖发现） */
 
     /* 延后 UWB 初始化到 app_process，避免卡死在 bu03_init */
     s_boot_ms = HAL_GetTick();
@@ -238,10 +267,10 @@ void app_init(I2C_HandleTypeDef* i2c_for_oled) {
     s_uwb_retry_count = 0;
     s_next_retry_ms = s_boot_ms + 100U;
 
-    OLED_Clear();
-    draw_header();
-    OLED_ShowString(0, 8, "Waiting UWB...");
-    OLED_Update();
+    // OLED_Clear();
+    // draw_header();
+    // OLED_ShowString(0, 8, "Waiting UWB...");
+    // OLED_Update();
 }
 
 void app_process(void) {
@@ -255,17 +284,17 @@ void app_process(void) {
             /* 提示 UWB 初始化 */
             OLED_Clear();
             draw_header();
-            OLED_ShowString(0, 8, "UWB Init...");
+            OLED_ShowString(0, 8, "UWB 1");
             OLED_Update();
 
-            const int rc = bu03_init();
+            const int rc = bu03_init();     //                  重置
             if (rc == 0) {
                 s_uwb_ok = 1;
 
                 /* 简要显示初始化完成与角色/状态 */
                 OLED_Clear();
                 draw_header();
-                OLED_ShowString(0, 8, "Init OK");
+                OLED_ShowString(0, 8, "UWB 2");
                 OLED_Update();
                 HAL_Delay(200);
                 ui_draw_ready();
@@ -299,16 +328,7 @@ void app_process(void) {
         bu03_process();
     }
 
-    /* 校准调度 */
-    uwb_calib_tick(now);
-
-    /* 根据状态绘制/更新 */
-    if (s_ui_state == UI_CALIBRATING) {
-        /* 周期性轻提示：校准中（一次性绘制已在回调中完成，这里可不重复绘制） */
-    } else if (s_ui_state == UI_READY) {
-        /* 就绪界面在回调与标签上报时刷新，无需每周期重绘 */
-    }
 
     /* 轻量延时，配合回调驱动 */
-    // HAL_Delay(1);
+    HAL_Delay(1);
 }

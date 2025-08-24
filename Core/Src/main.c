@@ -17,7 +17,11 @@
   */
 
 #include "main.h"
+
+#include <stdbool.h>
+
 #include "app.h"
+#include "UWB/uwb.h"
 
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
@@ -54,17 +58,27 @@ int main(void) {
     MX_USART1_UART_Init();
     MX_USB_PCD_Init();
 
+    /* 先初始化 UWB（确保收发与LED功能可用） */
+    (void) UWB_DW3000_Init();
+
     /* 应用初始化（OLED/UWB/发现/校准封装至 app） */
     app_init(&hi2c1);
 
     while (1) {
         app_process();
+
+        /* Tag 主动 POLL 任务（无需发现Anchor也会发送） */
+        uwb_periodic_task();
+
+        /* LED_RUN 心跳：每 500ms 翻转一次 */
+        static uint32_t s_last_run_ms = 0;
+        uint32_t now = HAL_GetTick();
+        if (now - s_last_run_ms >= 500U) {
+            HAL_GPIO_TogglePin(LED_RUN_GPIO_Port, LED_RUN_Pin);
+            s_last_run_ms = now;
+        }
     }
 }
-
-
-/* ================= UWB 角色逻辑与回调（Anchor/Tag） ================= */
-
 
 /**
   * @brief System Clock Configuration
@@ -285,7 +299,7 @@ static void MX_GPIO_Init(void) {
     /*Configure GPIO pin Output Level */
     HAL_GPIO_WritePin(GPIOB, DW_WAKEUP_Pin | DW_SYNC_Pin | PB12_Pin | PB13_Pin
                              | PB14_Pin | PB15_Pin | PB3_Pin | PB4_Pin
-                             | DW_IRQ_Pin | PB8_Pin | PB9_Pin, GPIO_PIN_RESET);
+                             | /* 移除 DW_IRQ_Pin，不要配置为输出 */ PB8_Pin | PB9_Pin, GPIO_PIN_RESET);
 
     /*Configure GPIO pin : PB13_Pin */
     GPIO_InitStruct.Pin = PB13_Pin;
@@ -305,10 +319,10 @@ static void MX_GPIO_Init(void) {
 
     /*Configure GPIO pins : DW_WAKEUP_Pin DW_SYNC_Pin PB12_Pin PB13_Pin
                              PB14_Pin PB15_Pin PB3_Pin PB4_Pin
-                             DW_IRQ_Pin PB8_Pin PB9_Pin */
+                             PB8_Pin PB9_Pin */
     GPIO_InitStruct.Pin = DW_WAKEUP_Pin | DW_SYNC_Pin | PB12_Pin | PB13_Pin
                           | PB14_Pin | PB15_Pin | PB3_Pin | PB4_Pin
-                          | DW_IRQ_Pin | PB8_Pin | PB9_Pin;
+                          | PB8_Pin | PB9_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -319,6 +333,18 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
+
+    // ... existing code ...
+    /* 正确配置 DW_IRQ_Pin 为外部中断输入（主动高，上升沿触发） */
+    GPIO_InitStruct.Pin = DW_IRQ_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN; /* 硬件若已下拉可改为 GPIO_NOPULL */
+    HAL_GPIO_Init(DW_IRQ_GPIO_Port, &GPIO_InitStruct);
+
+    /* 使能 EXTI9_5 中断 */
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
 
     /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -341,8 +367,7 @@ void Error_Handler(void) {
     }
     /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
@@ -355,6 +380,5 @@ void assert_failed(uint8_t *file, uint32_t line) {
     /* User can add his own implementation to report the file name and line number,
        ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
     /* USER CODE END 6 */
-
 }
 #endif /* USE_FULL_ASSERT */
