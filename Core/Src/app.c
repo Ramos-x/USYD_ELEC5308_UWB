@@ -201,11 +201,8 @@ void app_on_tag_ranges(uint32_t count, const uint32_t *anchor_ids, const float *
 
     /* 获取已标定的锚点 ID 列表，并与上报的距离进行对齐（取交集子集解算） */
     uint32_t calib_ids[8];
-    uint32_t n_ids = 0;
     /* 若实现存在最大限制，这里假设不超过 8 */
     if (calib_n > 8) calib_n = 8;
-    /* 需要从校准模块获得 ids */
-    n_ids = uwb_calib_get_anchor_ids(calib_ids, 8);
 
     uwb_vec3_t sel_anchors[8];
     float sel_dist[8];
@@ -249,7 +246,7 @@ void app_init(I2C_HandleTypeDef *i2c_for_oled) {
     OLED_ShowString(0, 24, __DATE__);
     OLED_ShowString(0, 32, __TIME__);
     OLED_Update();
-    // HAL_Delay(1200);
+    HAL_Delay(1000);
 
     /* 提示 UWB 初始化 */
     // OLED_Clear();
@@ -271,64 +268,68 @@ void app_init(I2C_HandleTypeDef *i2c_for_oled) {
     // draw_header();
     // OLED_ShowString(0, 8, "Waiting UWB...");
     // OLED_Update();
+
+    /* 延后 UWB 初始化，避免在 app_init 阶段卡死 */
+    uint32_t now = HAL_GetTick();
+    s_uwb_init_started = 1;
+
+    /* 提示 UWB 初始化 */
+    OLED_Clear();
+    draw_header();
+    OLED_ShowString(0, 8, "UWB 1");
+    OLED_Update();
+
+    const int rc = bu03_init(); //                  重置
+    if (rc == 0) {
+        s_uwb_ok = 1;
+
+        /* 简要显示初始化完成与角色/状态 */
+        OLED_Clear();
+        draw_header();
+        OLED_ShowString(0, 8, "UWB 2");
+        OLED_Update();
+        // HAL_Delay(200);
+        ui_draw_ready();
+    } else {
+        /* 显示失败并准备重试 */
+        OLED_Clear();
+        draw_header();
+        OLED_ShowString(0, 8, "UWB FAIL");
+        OLED_ShowString(0, 16, "Retrying...");
+        OLED_Update();
+
+        s_uwb_init_started = 0;
+        s_uwb_retry_count++;
+        if (s_uwb_retry_count >= 5) {
+            OLED_Clear();
+            draw_header();
+            OLED_ShowString(0, 8, "UWB ERROR");
+            OLED_ShowString(0, 16, "Check module");
+            OLED_Update();
+
+            /* 停止进一步重试，等待人工干预/复位 */
+            s_next_retry_ms = 0xFFFFFFFFu;
+            s_uwb_init_started = 1;
+        } else {
+            s_next_retry_ms = now + 500U;
+        }
+    }
 }
 
 void app_process(void) {
-    uint32_t now = HAL_GetTick();
-
-    /* 延后 UWB 初始化，避免在 app_init 阶段卡死 */
-    if (!s_uwb_ok) {
-        if (!s_uwb_init_started && (now >= s_next_retry_ms)) {
-            s_uwb_init_started = 1;
-
-            /* 提示 UWB 初始化 */
-            OLED_Clear();
-            draw_header();
-            OLED_ShowString(0, 8, "UWB 1");
-            OLED_Update();
-
-            const int rc = bu03_init();     //                  重置
-            if (rc == 0) {
-                s_uwb_ok = 1;
-
-                /* 简要显示初始化完成与角色/状态 */
-                OLED_Clear();
-                draw_header();
-                OLED_ShowString(0, 8, "UWB 2");
-                OLED_Update();
-                HAL_Delay(200);
-                ui_draw_ready();
-            } else {
-                /* 显示失败并准备重试 */
-                OLED_Clear();
-                draw_header();
-                OLED_ShowString(0, 8, "UWB FAIL");
-                OLED_ShowString(0, 16, "Retrying...");
-                OLED_Update();
-
-                s_uwb_init_started = 0;
-                s_uwb_retry_count++;
-                if (s_uwb_retry_count >= 5) {
-                    OLED_Clear();
-                    draw_header();
-                    OLED_ShowString(0, 8, "UWB ERROR");
-                    OLED_ShowString(0, 16, "Check module");
-                    OLED_Update();
-
-                    /* 停止进一步重试，等待人工干预/复位 */
-                    s_next_retry_ms = 0xFFFFFFFFu;
-                    s_uwb_init_started = 1;
-                } else {
-                    s_next_retry_ms = now + 500U;
-                }
-            }
-        }
-    } else {
-        /* UWB 处理（中断与协议驱动） */
-        bu03_process();
-    }
-
+    /* UWB 处理（中断与协议驱动） */
+    bu03_process();
 
     /* 轻量延时，配合回调驱动 */
     HAL_Delay(1);
+
+    /* LED_RUN */
+    static uint32_t s_last_run_ms = 0;
+    const uint32_t now = HAL_GetTick();
+    if (now - s_last_run_ms >= 500U) {
+        HAL_GPIO_WritePin(LED_RUN_GPIO_Port, LED_RUN_Pin, GPIO_PIN_SET);
+        s_last_run_ms = now;
+    } else if (now - s_last_run_ms == 8U) {
+        HAL_GPIO_TogglePin(LED_RUN_GPIO_Port, LED_RUN_Pin);
+    }
 }

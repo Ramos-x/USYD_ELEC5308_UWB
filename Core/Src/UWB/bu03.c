@@ -7,14 +7,14 @@
 
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 2.0f
+#define BU03_RATE_HZ_DEFAULT 10.0f
 #endif
 
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int   s_init_ok = 0;
 static int   s_last_err = 0;
 /* 运行时角色：由 PB2(BOOT1) 决定，0=Anchor, 1=Tag（上拉为1即Tag） */
-static int   s_role = BU03_ROLE_TAG;
+static int   s_role;
 
 void bu03_reset(void) {
     /* 仅重置运行时状态，角色在 init 中读取硬件后确定 */
@@ -28,8 +28,6 @@ int bu03_init(void) {
     if (s_init_ok) {
         return 0;
     }
-
-    /* 首次初始化前执行软复位，确保干净状态 */
     bu03_reset();
 
     /* 读取 PB2(BOOT1) 确定角色：0->Anchor，1->Tag */
@@ -37,7 +35,7 @@ int bu03_init(void) {
     s_role = (pin == GPIO_PIN_RESET) ? BU03_ROLE_ANCHOR : BU03_ROLE_TAG;
 
     /* 通用 UWB 初始化 */
-    int rc = UWB_DW3000_Init();
+    const int rc = UWB_DW3000_Init();
     if (rc != 0) {
         s_last_err = rc;  /* 记录底层返回的具体错误码 */
         return rc;        /* 直接把错误码返回给上层 */

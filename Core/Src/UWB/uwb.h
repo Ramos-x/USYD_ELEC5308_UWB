@@ -38,8 +38,8 @@ static inline uint32_t port_GetEXT_IRQStatus_impl(void) {
 
 // deca_mutex.c 期望的抽象接口（用 HAL 实现）
 #define port_GetEXT_IRQStatus()         port_GetEXT_IRQStatus_impl()
-#define port_DisableEXT_IRQ()           NVIC_DisableIRQ(DW3000_IRQ_EXTI_IRQn)
-#define port_EnableEXT_IRQ()            NVIC_EnableIRQ(DW3000_IRQ_EXTI_IRQn)
+// #define port_DisableEXT_IRQ()           NVIC_DisableIRQ(DW3000_IRQ_EXTI_IRQn)
+// #define port_EnableEXT_IRQ()            NVIC_EnableIRQ(DW3000_IRQ_EXTI_IRQn)
 #define port_CheckEXT_IRQ()             (HAL_GPIO_ReadPin(DW3000_IRQ_GPIO_Port, DW3000_IRQ_Pin) == GPIO_PIN_SET)
 
 #define port_SPIx_set_chip_select()	    HAL_GPIO_WritePin(DW3000_CS_GPIO_Port, DW3000_CS_Pin, GPIO_PIN_SET)
