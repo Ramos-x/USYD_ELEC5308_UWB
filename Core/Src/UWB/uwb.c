@@ -61,13 +61,22 @@ static inline void dw3000_isr_drain_all(void) {
     g_dw_isr_busy = 0;
 }
 
-void HAL_GPIO_EXTI_Callback(uint16_t pin) {
+// void HAL_GPIO_EXTI_Callback(uint16_t pin) {
+//     if (pin == DW_IRQ_Pin) {
+//         HAL_NVIC_DisableIRQ(DW3000_IRQ_EXTI_IRQn);
+//         dw3000_isr_drain_all(); // 把所有挂起源“吃干净”
+//         __HAL_GPIO_EXTI_CLEAR_IT(DW_IRQ_Pin);
+//         NVIC_ClearPendingIRQ(DW3000_IRQ_EXTI_IRQn);
+//         HAL_NVIC_EnableIRQ(DW3000_IRQ_EXTI_IRQn);
+//     }
+// }
+// 1) EXTI 回调：只干一件事——把 DW3000 的挂起事件吃干净
+void HAL_GPIO_EXTI_Callback(uint16_t pin)
+{
     if (pin == DW_IRQ_Pin) {
-        HAL_NVIC_DisableIRQ(DW3000_IRQ_EXTI_IRQn);
-        dw3000_isr_drain_all(); // 把所有挂起源“吃干净”
-        __HAL_GPIO_EXTI_CLEAR_IT(DW_IRQ_Pin);
-        NVIC_ClearPendingIRQ(DW3000_IRQ_EXTI_IRQn);
-        HAL_NVIC_EnableIRQ(DW3000_IRQ_EXTI_IRQn);
+        while (dwt_checkirq()) {
+            dwt_isr();   // 读/清芯片中断并分发到 on_rx_ok/on_tx_done/...
+        }
     }
 }
 
@@ -75,10 +84,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t pin) {
  * @brief  EXTI9_5 中断服务函数：转发给 HAL 处理
  * @note   确保 NVIC 里已使能 EXTI9_5_IRQn
  */
-void EXTI9_5_IRQHandler() {
-    HAL_GPIO_EXTI_IRQHandler(DW_IRQ_Pin);
-}
+void EXTI9_5_IRQHandler() { HAL_GPIO_EXTI_IRQHandler(DW_IRQ_Pin); }
 
+void EXTI15_10_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(DW_IRQ_Pin); }
 // ========== DW3000 初始化函数（C 接口导出） ==========
 
 /**
@@ -135,8 +143,6 @@ int UWB_DW3000_Init() {
 
     /* 启用 DW 芯片内部 LED（GPIO0~3 -> RXOK/SFD/RX/TX），并在初始化后闪烁一次 */
     dwt_setleds(DWT_LEDS_ENABLE | DWT_LEDS_INIT_BLINK);
-
-    // dwt_setcallbacks(on_tx_done, on_rx_ok, on_rx_to, on_rx_err, NULL, NULL);
 
     // 使能常用中断：RXOK/RXERR/RX 超时/TX 完成/ARFE 等
     uint32_t mask_lo = DWT_INT_RFCG | DWT_INT_RFCE | DWT_INT_RPHE |

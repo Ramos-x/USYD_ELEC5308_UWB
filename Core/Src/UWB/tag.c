@@ -43,47 +43,48 @@
 typedef struct {
     uint16_t pan;
     uint16_t anchor_id;
-    uint8_t  seq;         /* 建议用 RESP 的 seq+1 作为 FINAL 的序号 */
-    uint64_t t_tx1;       /* 本轮 POLL 的 T_tx1 */
-    uint64_t t_rx2;       /* 我方收到该 Anchor RESP 的时刻 */
+    uint8_t seq; /* 建议用 RESP 的 seq+1 作为 FINAL 的序号 */
+    uint64_t t_tx1; /* 本轮 POLL 的 T_tx1 */
+    uint64_t t_rx2; /* 我方收到该 Anchor RESP 的时刻 */
 } final_job_t;
 
 #define FINALQ_CAP  8
 static final_job_t s_finalq[FINALQ_CAP];
 static uint8_t s_qhead = 0, s_qtail = 0, s_qcount = 0;
-static uint8_t  s_resp_window_over = 0;     /* 本轮监听窗是否结束 */
-static uint64_t s_last_planned_ttx3 = 0;    /* 上一个 FINAL 计划的 t_tx3（40bit） */
+static uint8_t s_resp_window_over = 0; /* 本轮监听窗是否结束 */
+static uint64_t s_last_planned_ttx3 = 0; /* 上一个 FINAL 计划的 t_tx3（40bit） */
 
-static inline void finalq_reset(void){
+static inline void finalq_reset(void) {
     s_qhead = s_qtail = s_qcount = 0;
 }
+
 static int finalq_push_if_absent(uint16_t pan, uint16_t anchor_id, uint8_t seq,
-                                 uint64_t t_tx1, uint64_t t_rx2)
-{
+                                 uint64_t t_tx1, uint64_t t_rx2) {
     /* 去重：同一 Anchor 一轮只发一个 FINAL（需要更多策略可自行扩展） */
-    for (uint8_t i=0, idx=s_qhead; i<s_qcount; ++i, idx=(uint8_t)((idx+1)%FINALQ_CAP)){
+    for (uint8_t i = 0, idx = s_qhead; i < s_qcount; ++i, idx = (uint8_t) ((idx + 1) % FINALQ_CAP)) {
         if (s_finalq[idx].anchor_id == anchor_id) return 0; /* 已在队列 */
     }
     if (s_qcount >= FINALQ_CAP) return -1; /* 满 */
-    s_finalq[s_qtail] = (final_job_t){ .pan=pan, .anchor_id=anchor_id, .seq=seq, .t_tx1=t_tx1, .t_rx2=t_rx2 };
-    s_qtail = (uint8_t)((s_qtail + 1) % FINALQ_CAP);
+    s_finalq[s_qtail] = (final_job_t){.pan = pan, .anchor_id = anchor_id, .seq = seq, .t_tx1 = t_tx1, .t_rx2 = t_rx2};
+    s_qtail = (uint8_t) ((s_qtail + 1) % FINALQ_CAP);
     s_qcount++;
     return 1;
 }
-static inline final_job_t* finalq_peek(void){
+
+static inline final_job_t *finalq_peek(void) {
     return (s_qcount ? &s_finalq[s_qhead] : NULL);
 }
-static inline void finalq_pop(void){
+
+static inline void finalq_pop(void) {
     if (!s_qcount) return;
-    s_qhead = (uint8_t)((s_qhead + 1) % FINALQ_CAP);
+    s_qhead = (uint8_t) ((s_qhead + 1) % FINALQ_CAP);
     s_qcount--;
 }
 
 /* 40bit上取最大值（t 是 40bit 环形计数）*/
-static inline uint64_t max40(uint64_t a, uint64_t b){
-    return ( (int64_t)((a - b) & 0xFFFFFFFFFFULL) >= 0 ) ? a : b;
+static inline uint64_t max40(uint64_t a, uint64_t b) {
+    return ((int64_t) ((a - b) & 0xFFFFFFFFFFULL) >= 0) ? a : b;
 }
-
 
 
 /* 最近一次 POLL 的 TX 时间戳（40bit，放入 64bit） */
@@ -183,9 +184,24 @@ static void on_tx_done(const dwt_cb_data_t *cb) {
     }
 
     if (s_phase == TAG_FINAL_SCHEDULED) {
-        // FINAL 已发完：本轮会话结束，解锁并回 RX
-        s_phase = TAG_IDLE;
-        s_tx_busy = 0;
+        /* 当前 FINAL 成功发出：弹出队首 */
+        finalq_pop();
+
+        if (s_qcount > 0) {
+            /* 队列还有 Anchor：继续排程下一帧 FINAL */
+            (void) dwt_rxenable(DWT_START_RX_IMMEDIATE); // 发前保持接收，直到真正 TX 时间
+            schedule_next_final();
+            return;
+        }
+
+        /* 队列空了：若监听窗已结束 -> 本轮结束；否则回到“等 RESP”继续收 */
+        if (s_resp_window_over) {
+            s_phase = TAG_IDLE;
+            s_tx_busy = 0;
+            dwt_setrxtimeout(0);
+        } else {
+            s_phase = TAG_WAIT_RESP;
+        }
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
@@ -195,12 +211,9 @@ static void on_tx_done(const dwt_cb_data_t *cb) {
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
-/* RX 成功：解析 RESP，计算 SS-TWR 距离 */
-/* RX 成功：解析 RESP，计算距离，并排程 FINAL（不解锁，交给 on_tx_done 收尾） */
 static void on_rx_ok(const dwt_cb_data_t *cb) {
-
     if (s_phase != TAG_WAIT_RESP && s_phase != TAG_FINAL_SCHEDULED) {
-        (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
 
@@ -210,81 +223,71 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
     dwt_readrxdata(rxbuf, rxlen, 0);
 
     uwb_frame_view_t v;
-    if (uwb_parse_frame(rxbuf, rxlen, &v) != 0) { return; }
-    if (v.hdr->pan != g_pan_id) { return; }
-    if (uwb_get_msg_type(&v) != UWB_MSG_RESP) { return; }
+    if (uwb_parse_frame(rxbuf, rxlen, &v) != 0) {
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+    if (v.hdr->pan != g_pan_id) {
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+    if (uwb_get_msg_type(&v) != UWB_MSG_RESP) {
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+    if (v.payload_len < sizeof(pl_resp_t)) {
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
 
-    if (v.payload_len < sizeof(pl_resp_t)) { return; }
     const pl_resp_t *pl = (const pl_resp_t *) v.payload;
-
     uint16_t anchor_id = v.hdr->src;
-    anchor_info_t *e = find_or_alloc_anchor(anchor_id);
-    if (!e) { return; }
 
-    uint64_t t_rx1 = uwb_ts40_to_64(pl->t_rx1);
-    uint64_t t_tx2 = uwb_ts40_to_64(pl->t_tx2);
-
+    /* 本端接收该 RESP 的时刻 */
     uint8_t rxts5[5];
     dwt_readrxtimestamp(rxts5);
     uint64_t t_rx2 = uwb_ts40_to_64(rxts5);
 
-    const uint64_t TS_MASK_40 = 0xFFFFFFFFFFULL;
-    uint64_t t_tx1 = g_last_poll_tx_ts & TS_MASK_40;
+    /* 入队（去重）：FINAL 的序号用 (RESP.seq + 1) */
+    (void) finalq_push_if_absent(v.hdr->pan, anchor_id, (uint8_t) (v.hdr->seq + 1),
+                                 g_last_poll_tx_ts, t_rx2);
 
-    // 计划 FINAL 的发射时刻（延迟发送）
-    uint64_t t_tx3 = (t_rx2 + FINAL_DELAY_DTU) & TS_MASK_40;
-    uint64_t tround = (t_rx2 - t_tx1) & TS_MASK_40;
-    uint64_t treply = (t_tx2 - t_rx1) & TS_MASK_40;
+    /* 可选：这里仍保留你的 SS-TWR 估距（用于调试/UI），略 */
 
-    // 组 FINAL
-    uint8_t ftx[64];
-    uint16_t flen = uwb_build_final(
-        ftx,
-        (uint8_t) (v.hdr->seq + 1),
-        v.hdr->pan,
-        v.hdr->src, // dest = Anchor
-        g_tag_short, // src  = Tag
-        g_last_poll_tx_ts, t_rx2, t_tx3
-    );
+    /* 如果当前还没有排程 FINAL，则立刻尝试为队首排一个 */
 
-    // 排程 FINAL：进入 FINAL_SCHEDULED 阶段；失败才解锁
-    if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
-        dwt_writetxfctrl(flen + 2, 0, 1);
-        dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
-        if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
-            s_phase = TAG_FINAL_SCHEDULED; // [SESSION LOCK]
-        } else {
-            // 延迟启动失败：结束会话，解锁
-            s_phase = TAG_IDLE;
-            s_tx_busy = 0;
-            (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        }
-    } else {
-        s_phase = TAG_IDLE;
-        s_tx_busy = 0;
-        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    if (s_phase == TAG_WAIT_RESP && s_qcount == 1) {
+        /* 队列从 0→1，立刻排第一帧 FINAL */
+        schedule_next_final();
+        return;
     }
 
-    // SS-TWR 距离（调试/上报用）
-    double tof_dtu = 0.5 * (double) ((int64_t) tround - (int64_t) treply);
-    if (tof_dtu < 0) tof_dtu = 0;
-    double distance_m = tof_dtu * DWT_TIME_UNITS * SPEED_OF_LIGHT;
-
-    memcpy(e->ts, pl->t_rx1, 5);
-    e->dist_m = (float) distance_m;
-    e->last_tick = HAL_GetTick();
-    e->updated = 1;
-}
-
-/* RX 超时：仅在“等 RESP”阶段结束会话；若 FINAL 已排程则等待 on_tx_done */
-static void on_rx_to(const dwt_cb_data_t *cb) {
-    (void) cb;
-    if (s_phase == TAG_WAIT_RESP) {
-        s_phase = TAG_IDLE;
-        s_tx_busy = 0;
-    }
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
+
+
+static void on_rx_to(const dwt_cb_data_t *cb) {
+    (void) cb;
+    s_resp_window_over = 1;
+
+    if (s_phase == TAG_WAIT_RESP) {
+        if (s_qcount > 0) {
+            /* 窗结束但还有待发 FINAL：立即开始串行发 */
+            schedule_next_final();
+        } else {
+            /* 无待发：本轮结束 */
+            s_phase = TAG_IDLE;
+            s_tx_busy = 0;
+            dwt_setrxtimeout(0);
+            (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        }
+        return;
+    }
+
+    /* 若已在 TAG_FINAL_SCHEDULED，就等 on_tx_done() 收尾 */
+    (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
 
 /* RX 错误：不解锁，继续本轮会话 */
 static void on_rx_err(const dwt_cb_data_t *cb) {
@@ -370,7 +373,7 @@ void tag_set_rate_hz(float rate) {
 
 /* ====================== Tag 主动 POLL ====================== */
 static uint8_t s_tag_proactive_enabled = 1;
-static uint32_t s_tag_poll_interval_ms = 1000;
+static uint32_t s_tag_poll_interval_ms = 400;
 static uint32_t s_tag_last_poll_ms = 0;
 static uint8_t s_tag_seq = 0;
 
@@ -385,17 +388,69 @@ static void tag_proactive_try_send_poll(void) {
     if (dwt_writetxdata(mac_len, tx, 0) == DWT_SUCCESS) {
         dwt_writetxfctrl(mac_len + 2, 0, 1);
         dwt_setrxaftertxdelay(0);
-        dwt_setrxtimeout(RESP_WINDOW_US);     /* 覆盖完整时隙窗的监听时间 */
+        dwt_setrxtimeout(RESP_WINDOW_US); /* 覆盖完整时隙窗的监听时间 */
 
         if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) == DWT_SUCCESS) {
             s_tx_busy = 1;
-            s_phase   = TAG_WAIT_RESP;
+            s_phase = TAG_WAIT_RESP;
             s_resp_window_over = 0;
             s_last_planned_ttx3 = 0;
             finalq_reset();
         }
     }
 }
+
+/* 构建并排程下一帧 FINAL（队首），成功则转入 TAG_FINAL_SCHEDULED */
+static void schedule_next_final(void) {
+    final_job_t *job = finalq_peek();
+    if (!job) return;
+
+    const uint64_t TS_MASK_40 = 0xFFFFFFFFFFULL;
+
+    /* 该 Anchor 希望的基准发送时刻：其 RESP 被我们收到后的固定延迟 */
+    uint64_t base_ttx3 = (job->t_rx2 + FINAL_DELAY_DTU) & TS_MASK_40;
+
+    /* 串行链：确保与上一帧 FINAL 相隔至少 FINAL_CHAIN_GAP_DTU */
+    uint64_t t_tx3 = base_ttx3;
+    if (s_last_planned_ttx3) {
+        uint64_t min_next = (s_last_planned_ttx3 + FINAL_CHAIN_GAP_DTU) & TS_MASK_40;
+        t_tx3 = max40(t_tx3, min_next);
+    }
+
+    /* 组 FINAL（带 T_tx1/T_rx2/T_tx3） */
+    uint8_t ftx[64];
+    uint16_t flen = uwb_build_final(ftx, job->seq, job->pan,
+                                    job->anchor_id, g_tag_short,
+                                    job->t_tx1, job->t_rx2, t_tx3);
+
+    /* 发起延迟发送 */
+    if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
+        dwt_writetxfctrl(flen + 2, 0, 1);
+        dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
+
+        if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
+            s_phase = TAG_FINAL_SCHEDULED;
+            s_last_planned_ttx3 = t_tx3;
+            return;
+        }
+    }
+
+    /* 如果失败（可能错过时间），小幅推迟一格再试一次；再失败就丢弃该 job */
+    t_tx3 = (t_tx3 + FINAL_CHAIN_GAP_DTU) & TS_MASK_40;
+    if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
+        dwt_writetxfctrl(flen + 2, 0, 1);
+        dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
+        if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
+            s_phase = TAG_FINAL_SCHEDULED;
+            s_last_planned_ttx3 = t_tx3;
+            return;
+        }
+    }
+
+    /* 彻底失败：丢弃该 Anchor，本轮继续 */
+    finalq_pop();
+}
+
 
 /* 对外周期任务：按周期主动发 POLL */
 void uwb_periodic_task(void) {
@@ -421,7 +476,11 @@ void tag_init(void) {
 
     /* 回调与中断（可按需扩展 RX 错误/超时类中断） */
     dwt_setcallbacks(on_tx_done, on_rx_ok, on_rx_to, on_rx_err, NULL, NULL);
-    dwt_setinterrupt(DWT_INT_RFCG | DWT_INT_TFRS, 0, DWT_ENABLE_INT);
+    dwt_setinterrupt(
+        DWT_INT_RFCG | DWT_INT_TFRS | DWT_INT_RFTO |
+        DWT_INT_RFCE | DWT_INT_RPHE | DWT_INT_RFSL |
+        DWT_INT_RXOVRR | DWT_INT_CPERR | DWT_INT_ARFE,
+        0, DWT_ENABLE_INT);
 
     /* 持续接收 */
     dwt_setrxtimeout(0);
@@ -432,6 +491,10 @@ void tag_init(void) {
 
     s_phase = TAG_IDLE; // [SESSION LOCK]
     s_tx_busy = 0;
+
+    while (dwt_checkirq()) {
+        dwt_isr(); // 把“上电遗留”的事件清掉，IRQ 线会回到低电平
+    }
 }
 
 void tag_process(void) {

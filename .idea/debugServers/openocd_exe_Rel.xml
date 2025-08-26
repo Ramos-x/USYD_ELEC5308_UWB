@@ -4,7 +4,7 @@
       <debugger kind="GDB" isBundled="true" />
       <env />
     </debugger>
-    <gdbserver exe="D:\Program Files\openocd-v0.12.0-i686-w64-mingw32\bin\openocd.exe" args="-f interface/stlink.cfg -f target/stm32f1x.cfg">
+    <gdbserver exe="$PROJECT_DIR$/../../../../../../../Program Files/openocd-v0.12.0-i686-w64-mingw32/bin/openocd.exe" args="-f interface/stlink.cfg -f target/stm32f1x.cfg">
       <env script="" />
     </gdbserver>
     <console enabled="true" port="4444" />

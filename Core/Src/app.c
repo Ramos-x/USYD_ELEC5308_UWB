@@ -66,8 +66,8 @@ static void draw_header(void) {
         (void) snprintf(idbuf, sizeof(idbuf), "ACR:%04X", (unsigned) anchor_get_short());
         OLED_ShowString(64, 8, idbuf);
     } else {
-        OLED_ShowString(0, 0, "ROLE:-");
-        OLED_ShowString(64, 0, "UWB:...");
+        OLED_ShowString(0, 0, "ROLE:");
+        OLED_ShowString(64, 0, "UWB:");
     }
 }
 
