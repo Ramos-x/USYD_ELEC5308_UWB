@@ -48,7 +48,8 @@ static inline uint32_t port_GetEXT_IRQStatus_impl(void) {
 
 #define portGetTickCount() 				portGetTickCnt()
 
-
+void port_DisableEXT_IRQ(void);
+void port_EnableEXT_IRQ(void);
 /**
  * @brief 软件延时计数（来自时基中断递增）
  */

@@ -7,6 +7,8 @@
 #include "bu03.h"
 #include "app.h"
 #include "anchor.h"
+
+#include "uwb_frames.h"
 #include "OLED/oled.h"
 
 /* 距离/时间常量与延迟应答配置 */
@@ -58,7 +60,7 @@ void anchor_randomize_short(void) {
     g_anchor_short = id;
 }
 
-/* 提供对外读取 Tag 短地址的接口 */
+/* 提供对外读取 anchor 短地址的接口 */
 uint16_t anchor_get_short(void) {
     return g_anchor_short;
 }
@@ -98,59 +100,42 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
     uint16_t rxlen = cb->datalength;
     if (rxlen > sizeof(rxbuf)) rxlen = sizeof(rxbuf);
     dwt_readrxdata(rxbuf, rxlen, 0);
-    uart1_println(rxbuf);
 
-    if (rxlen < 13) {
+    uwb_frame_view_t v;
+    if (uwb_parse_frame(rxbuf, rxlen, &v) != 0) {
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+    if (v.hdr->pan != g_pan_id || uwb_get_msg_type(&v) != UWB_MSG_POLL) {
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
 
-    /* 仅处理 'P''O''L''L' */
-    if (!(rxbuf[9] == 'P' && rxbuf[10] == 'O' && rxbuf[11] == 'L' && rxbuf[12] == 'L')) {
-        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        return;
-    }
-
+    /* 速率限制 */
     uint32_t now = HAL_GetTick();
     if ((now - g_last_tx_ms) < g_min_interval_ms) {
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
 
-    /* PAN 与源（即 TAG 短地址） */
-    uint16_t pan = (uint16_t) rxbuf[3] | ((uint16_t) rxbuf[4] << 8);
-    uint16_t tag_short = (uint16_t) rxbuf[7] | ((uint16_t) rxbuf[8] << 8);
-
-    /* 读取 RX 时间戳（5B -> 64bit）并计算计划的 TX 时间戳（延迟发送） */
+    /* 时间戳：读取本帧的 RX 时间，计算计划的 TX 时间（延迟发送） */
     uint8_t rxts5[5];
     dwt_readrxtimestamp(rxts5);
-    uint64_t t_rx1 = 0;
-    for (int k = 0; k < 5; ++k) t_rx1 |= ((uint64_t) rxts5[k]) << (8 * k);
+    uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
     uint64_t t_tx2 = t_rx1 + REPLY_DELAY_DTU;
 
-    /* 组装 RSP: FCF + SEQ + PAN + Dst(TAG) + Src(ANCHOR) + 'R''S''P' + RX_TS[5] + TX_TS[5] */
-    uint8_t tx[64];
-    uint8_t i = 0;
-    tx[i++] = 0x41;
-    tx[i++] = 0x88;
-    tx[i++] = (uint8_t) (rxbuf[2] + 1);
-    tx[i++] = (uint8_t) (pan & 0xFF);
-    tx[i++] = (uint8_t) (pan >> 8);
-    tx[i++] = (uint8_t) (tag_short & 0xFF);
-    tx[i++] = (uint8_t) (tag_short >> 8);
-    tx[i++] = (uint8_t) (g_anchor_short & 0xFF);
-    tx[i++] = (uint8_t) (g_anchor_short >> 8);
-    tx[i++] = 'R';
-    tx[i++] = 'S';
-    tx[i++] = 'P';
-    for (int k = 0; k < 5; ++k) tx[i++] = rxts5[k];
-    for (int k = 0; k < 5; ++k) tx[i++] = (uint8_t) ((t_tx2 >> (8 * k)) & 0xFF);
+    /* 组 RESP 帧（目的=发起方，源=本 Anchor） */
+    uint8_t txbuf[64];
+    uint16_t mac_len = uwb_build_resp(txbuf,
+                                      (uint8_t) (v.hdr->seq + 1),
+                                      v.hdr->pan,
+                                      v.hdr->src, /* dest = tag  */
+                                      g_anchor_short, /* src  = anchor */
+                                      t_rx1, t_tx2);
 
-    uint16_t txlen = i;
-    if (dwt_writetxdata(txlen, tx, 0) == DWT_SUCCESS) {
-        dwt_writetxfctrl(txlen + 2, 0, 1);
-        /* 设定延迟发射时间（高 32 位）并延迟发送 */
-        dwt_setdelayedtrxtime((uint32_t) (t_tx2 >> 8));
+    if (dwt_writetxdata(mac_len, txbuf, 0) == DWT_SUCCESS) {
+        dwt_writetxfctrl(mac_len + 2, 0, 1);          /* +2 包含 FCS；rng=1 */
+        dwt_setdelayedtrxtime((uint32_t)(t_tx2 >> 8));/* 仅写高 32 位 */
         if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
             g_last_tx_ms = now;
         } else {
@@ -193,5 +178,4 @@ void anchor_init(void) {
     g_last_tx_ms = HAL_GetTick();
 }
 
-void anchor_process(void) {
-}
+void anchor_process(void) {}

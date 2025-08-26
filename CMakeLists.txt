@@ -47,7 +47,10 @@ add_executable(${CMAKE_PROJECT_NAME}
         Core/Src/OLED/oled.c
         Core/Src/UWB/calibration.c
         Core/Src/UWB/discovery.c
-        Core/Src/app.c)
+        Core/Src/app.c
+        Core/Src/UWB/uwb_frames.c
+        Core/Src/UWB/uwb_frames.h
+)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
