@@ -1,5 +1,5 @@
 <component name="DebugServers">
-  <generic-debug-target name="openocd.exe Rel" uniqueID="7fc54f1a-8aab-406e-8c18-7574b54dead9">
+  <generic-debug-target name="openocd.exe Rel" uniqueID="7fc54f1a-8aab-406e-8c18-7574b54dead9" selected="true">
     <debugger version="1">
       <debugger kind="GDB" isBundled="true" />
       <env />

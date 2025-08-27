@@ -5,6 +5,7 @@
 extern "C" {
 
 
+
 #endif
 
 void tag_init(void);
@@ -18,6 +19,8 @@ void tag_randomize_short(void);
 
 /* 获取当前 Tag 的16位短地址 */
 uint16_t tag_get_short(void);
+
+static void uart1_printf(const char *fmt, ...);
 
 /* 构建并排程下一帧 FINAL（队首），成功则转入 TAG_FINAL_SCHEDULED */
 static void schedule_next_final(void);

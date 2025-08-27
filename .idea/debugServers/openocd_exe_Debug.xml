@@ -1,5 +1,5 @@
 <component name="DebugServers">
-  <generic-debug-target name="openocd.exe Debug" uniqueID="42725b99-0024-40d0-8b5c-0eca6839743d" selected="true">
+  <generic-debug-target name="openocd.exe Debug" uniqueID="42725b99-0024-40d0-8b5c-0eca6839743d">
     <debugger version="1">
       <debugger toolchainName="STM32CubeCLT" />
       <env />

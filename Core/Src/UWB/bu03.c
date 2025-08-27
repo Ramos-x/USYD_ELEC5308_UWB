@@ -71,7 +71,7 @@ void bu03_process(void) {
 void bu03_set_rate_hz(float rate) {
     s_rate_hz = rate;
     if (s_role == BU03_ROLE_ANCHOR) {
-        anchor_set_rate_hz(rate);
+        anchor_set_rate_hz(20.0f);
     } else {
         tag_set_rate_hz(rate);
     }

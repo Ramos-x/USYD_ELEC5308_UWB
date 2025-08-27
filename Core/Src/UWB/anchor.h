@@ -11,7 +11,8 @@ void anchor_init(void);
 void anchor_process(void);
 
 void anchor_set_rate_hz(float rate);
-    static void uart1_printf(const char *fmt, ...);
+
+static void uart1_printf(const char *fmt, ...);
 /* 基于芯片唯一ID随机化 Anchor 的16位短地址（保证不同设备不重复） */
 void anchor_randomize_short(void);
 

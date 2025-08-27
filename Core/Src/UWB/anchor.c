@@ -33,11 +33,11 @@
 #endif
 #ifndef DTU_TO_MM_I32
 #define DTU_TO_MM_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*299702547.0*1000.0 + 0.5) )
+#endif
 #ifndef DTU_TO_NS_I32
 #define DTU_TO_NS_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*1e9 + 0.5) )
 #endif
 
-#endif
 #ifndef DTU_TO_NS_I64
 #define DTU_TO_NS_I64(dtu64) ((int64_t)((double)(dtu64)*DWT_TIME_UNITS*1e9 + 0.5))
 #endif
@@ -45,6 +45,10 @@
 #define DTU_TO_MM_I64(dtu64) ((int64_t)((double)(dtu64)*DWT_TIME_UNITS*SPEED_OF_LIGHT*1000.0 + 0.5))
 #endif
 
+#define TS_MASK_40 0xFFFFFFFFFFULL
+#define ANCHOR_REPLY_BASE_US     2500U      // 基准(首个Anchor)的延迟
+#define ANCHOR_SLOT_SPACING_US   2000U      // 邻近两个Anchor之间的时隙间隔
+#define NUM_ANCHOR_SLOTS         4          // 先给够，后面想扩到更多Anchor也行
 static volatile uint8_t s_sending_resp = 0;
 static volatile uint16_t s_resp_tag_pending = 0;
 
@@ -63,7 +67,7 @@ static uint16_t g_anchor_short = 0x5678;
 static const uint16_t g_broadcast_short = 0xFFFF;
 
 /* 节流：避免过快重复发 RESP（可保留） */
-static volatile uint32_t g_min_interval_ms = 500;
+static volatile uint32_t g_min_interval_ms = 1;
 static volatile uint32_t g_last_tx_ms = 0;
 
 /* 最近一次 RESP 的计划发送时间戳（40bit->64）按 Tag 维度保存 */
@@ -103,6 +107,11 @@ static void sess_clear(uint16_t tag) {
             s_sess[i].active = 0;
             break;
         }
+}
+
+static inline uint8_t anchor_slot_index(void) {
+    // 简单从短地址派生：0..NUM_ANCHOR_SLOTS-1
+    return (uint8_t) (g_anchor_short % NUM_ANCHOR_SLOTS);
 }
 
 /* UART1 */
@@ -146,23 +155,22 @@ void anchor_randomize_short(void) {
         id ^= 0xA5A5u;
         if (id == 0x0000u || id == 0xFFFFu) id ^= 0x1D0Fu;
     }
-    g_anchor_short = id;
+    // g_anchor_short = id;
+    g_anchor_short = 0x0001;
 }
 
 uint16_t anchor_get_short(void) { return g_anchor_short; }
 
-static void ts40_to_hex(char out[11], uint64_t ts40)
-{
+static void ts40_to_hex(char out[11], uint64_t ts40) {
     // 40bit 小端->HEX（高位在前）
     uint8_t b[5];
-    for (int i = 0; i < 5; ++i) b[i] = (uint8_t)((ts40 >> (8*i)) & 0xFF);
-    for (int i = 0; i < 5; ++i) sprintf(out + 2*i, "%02X", b[4-i]);
+    for (int i = 0; i < 5; ++i) b[i] = (uint8_t) ((ts40 >> (8 * i)) & 0xFF);
+    for (int i = 0; i < 5; ++i) sprintf(out + 2 * i, "%02X", b[4 - i]);
     out[10] = '\0';
 }
 
 // 相对微秒（先在40bit域内做差，再转us）
-static inline int32_t rel_us(uint64_t newer, uint64_t older)
-{
+static inline int32_t rel_us(uint64_t newer, uint64_t older) {
     uint64_t d = (newer - older) & TS_MASK_40;
     return DTU_TO_US_I32(d); // <= 17,200,000 以内，int32 安全
 }
@@ -175,18 +183,20 @@ static void on_tx_done(const dwt_cb_data_t *cb) {
     (void) cb;
 
     if (s_sending_resp) {
-        uint8_t txts5[5]; dwt_readtxtimestamp(txts5);
+        uint8_t txts5[5];
+        dwt_readtxtimestamp(txts5);
         uint64_t real_tx2 = uwb_ts40_to_64(txts5);
 
         ds_sess_t *sess = sess_find(s_resp_tag_pending);
         if (sess && sess->active) {
-            int32_t plan_off_us = rel_us(sess->t_tx2, sess->t_rx1);     // 计划延迟（应≈3000us）
-            int32_t real_off_us = rel_us(real_tx2,    sess->t_rx1);     // 实际延迟
+            int32_t plan_off_us = rel_us(sess->t_tx2, sess->t_rx1); // 计划延迟（应≈3000us）
+            int32_t real_off_us = rel_us(real_tx2, sess->t_rx1); // 实际延迟
 
-            char real_hex[11]; ts40_to_hex(real_hex, real_tx2);
+            char real_hex[11];
+            ts40_to_hex(real_hex, real_tx2);
             uart1_printf("[RESP] tag=%u real_tx2=0x%s plan_off=%ldus real_off=%ldus",
-                         (unsigned)s_resp_tag_pending, real_hex,
-                         (long)plan_off_us, (long)real_off_us);
+                         (unsigned) s_resp_tag_pending, real_hex,
+                         (long) plan_off_us, (long) real_off_us);
 
             sess->t_tx2 = real_tx2; // 用真实TX时间覆盖
         }
@@ -247,7 +257,13 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
         uint8_t rxts5[5];
         dwt_readrxtimestamp(rxts5);
         uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
-        uint64_t t_tx2 = (t_rx1 + REPLY_DELAY_DTU) & 0xFFFFFFFFFFULL;
+
+
+        uint8_t slot = anchor_slot_index();
+        uint64_t delay_dtu = US_TO_DTU(ANCHOR_REPLY_BASE_US + slot * ANCHOR_SLOT_SPACING_US);
+        uint64_t t_tx2 = (t_rx1 + delay_dtu) & TS_MASK_40;
+
+        // uint64_t t_tx2 = (t_rx1 + REPLY_DELAY_DTU) & 0xFFFFFFFFFFULL;
 
         /* 记录会话（按 Tag 短地址），期望的 FINAL 序号= poll.seq+2 */
         uint16_t tag_id = v.hdr->src;
@@ -285,16 +301,14 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
             }
         } else {
             (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        }
-
-        {
+        } {
             char rx1_hex[11], plan_hex[11];
             ts40_to_hex(rx1_hex, t_rx1);
             ts40_to_hex(plan_hex, t_tx2);
 
             uart1_printf("[POLL] tag=%u seq=%u rx1=0x%s plan_tx2=0x%s d_us=%ld",
-                         (unsigned)tag_id, (unsigned)v.hdr->seq, rx1_hex, plan_hex,
-                         (long)rel_us(t_tx2, t_rx1));
+                         (unsigned) tag_id, (unsigned) v.hdr->seq, rx1_hex, plan_hex,
+                         (long) rel_us(t_tx2, t_rx1));
         }
 
         return;
@@ -360,25 +374,24 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         // ---- 差值与 ToF（DTU）----
-        int64_t d1 = (int64_t)((Tround1 - Treply1) & TS_MASK_40);
-        int64_t d2 = (int64_t)((Tround2 - Treply2) & TS_MASK_40);
+        int64_t d1 = (int64_t) ((Tround1 - Treply1) & TS_MASK_40);
+        int64_t d2 = (int64_t) ((Tround2 - Treply2) & TS_MASK_40);
         int64_t tof_dtu_i64 = (d1 + d2) / 4;
         if (tof_dtu_i64 < 0) tof_dtu_i64 = 0;
 
         // 32 位展示值（足够）
-        int32_t d1_ns   = DTU_TO_NS_I32(d1);
-        int32_t d2_ns   = DTU_TO_NS_I32(d2);
-        int32_t tof_ns  = DTU_TO_NS_I32(tof_dtu_i64);
+        int32_t d1_ns = DTU_TO_NS_I32(d1);
+        int32_t d2_ns = DTU_TO_NS_I32(d2);
+        int32_t tof_ns = DTU_TO_NS_I32(tof_dtu_i64);
         int32_t dist_mm = DTU_TO_MM_I32(tof_dtu_i64);
 
         uart1_printf("[FINAL] tag=%u d1=%ldDTU(%ldns) d2=%ldDTU(%ldns) "
                      "ToF=%ldDTU(%ldns) dist=%ld.%03ldm",
-                     (unsigned)tag_id,
-                     (long)d1, (long)d1_ns,
-                     (long)d2, (long)d2_ns,
-                     (long)tof_dtu_i64, (long)tof_ns,
-                     (long)(dist_mm/1000), (long)labs(dist_mm%1000));
-
+                     (unsigned) tag_id,
+                     (long) d1, (long) d1_ns,
+                     (long) d2, (long) d2_ns,
+                     (long) tof_dtu_i64, (long) tof_ns,
+                     (long) (dist_mm / 1000), (long) labs(dist_mm % 1000));
 
 
         return;
@@ -405,7 +418,8 @@ static void uart1_printf(const char *fmt, ...) {
 void anchor_set_rate_hz(float rate) {
     if (rate < 0.1f) rate = 0.1f;
     if (rate > 100.0f) rate = 100.0f;
-    g_min_interval_ms = (uint32_t) (1000.0f / rate + 0.5f);
+    // g_min_interval_ms = (uint32_t) (1000.0f / rate + 0.5f);
+    g_min_interval_ms = (uint32_t) (0);
 }
 
 void anchor_init(void) {
