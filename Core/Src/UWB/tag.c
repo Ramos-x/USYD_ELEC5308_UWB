@@ -245,7 +245,7 @@ void tag_randomize_short(void) {
         if (id == 0x0000u || id == 0xFFFFu) id ^= 0x1D0Fu;
     }
     // g_tag_short = id;
-    g_tag_short = 0x000A
+    g_tag_short = 0x000A;
 }
 
 /* 提供对外读取 Tag 短地址的接口 */
@@ -278,6 +278,7 @@ static anchor_info_t *find_or_alloc_anchor(uint16_t id) {
     }
     return NULL;
 }
+
 
 /* HEX 辅助 */
 
@@ -344,12 +345,12 @@ static void on_tx_done(const dwt_cb_data_t *cb) {
     if (s_phase == TAG_WAIT_RESP) {
         g_last_poll_tx_ts = uwb_ts40_to_64(txts5);
 
-        log_evt_t ev = {
-            .type = LE_POLL_TX,
-            .seq = (uint8_t) (s_tag_seq ? (s_tag_seq - 1) : 0),
-            .t1 = g_last_poll_tx_ts
-        };
-        log_push(&ev);
+        // log_evt_t ev = {
+        //     .type = LE_POLL_TX,
+        //     .seq = (uint8_t) (s_tag_seq ? (s_tag_seq - 1) : 0),
+        //     .t1 = g_last_poll_tx_ts
+        // };
+        // log_push(&ev);
 
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
@@ -360,8 +361,8 @@ static void on_tx_done(const dwt_cb_data_t *cb) {
         uint8_t txts5b[5];
         dwt_readtxtimestamp(txts5b);
         uint64_t tx3_real = uwb_ts40_to_64(txts5b);
-        log_evt_t ev = {.type = LE_FINAL_TX, .t1 = tx3_real};
-        log_push(&ev);
+        // log_evt_t ev = {.type = LE_FINAL_TX, .t1 = tx3_real};
+        // log_push(&ev);
 
         /* 当前 FINAL 成功发出：弹出队首 */
         finalq_pop();
@@ -433,20 +434,20 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
         char rx2_hex[11];
         ts40_to_hex(rx2_hex, t_rx2);
 
-        log_evt_t ev = {
-            .type = LE_RESP_RX,
-            .acr = anchor_id,
-            .seq = v.hdr->seq,
-            .qcnt = s_qcount,
-            .t1 = t_rx2
-        };
-        log_push(&ev);
+        // log_evt_t ev = {
+        //     .type = LE_RESP_RX,
+        //     .acr = anchor_id,
+        //     .seq = v.hdr->seq,
+        //     .qcnt = s_qcount,
+        //     .t1 = t_rx2
+        // };
+        // log_push(&ev);
 
 
         // 让 try_flush_json() 有东西可发
         anchor_info_t *ai = find_or_alloc_anchor(anchor_id);
         if (ai) {
-            // 这里随手把“我们收到 RESP 的时刻”写进去，便于上位机观测
+            ai->id = anchor_id; // ★确保保存真实 Anchor 短地址
             uint8_t ts5[5] = {
                 (uint8_t) (t_rx2 & 0xFF), (uint8_t) ((t_rx2 >> 8) & 0xFF),
                 (uint8_t) ((t_rx2 >> 16) & 0xFF), (uint8_t) ((t_rx2 >> 24) & 0xFF),
@@ -454,7 +455,7 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
             };
             memcpy(ai->ts, ts5, 5);
             ai->last_tick = HAL_GetTick();
-            ai->dist_m = 0; // 这里不算距离，只是让 JSON 出来
+            ai->dist_m = 0;
             ai->updated = 1;
         }
     }
@@ -476,8 +477,8 @@ static void on_rx_to(const dwt_cb_data_t *cb) {
     s_resp_window_over = 1;
 
     if (s_phase == TAG_WAIT_RESP) {
-        log_evt_t ev = {.type = LE_RESP_WIN_END, .qcnt = s_qcount};
-        log_push(&ev);
+        // log_evt_t ev = {.type = LE_RESP_WIN_END, .qcnt = s_qcount};
+        // log_push(&ev);
 
         if (s_qcount > 0) {
             /* 窗结束但还有待发 FINAL：立即开始串行发 */
@@ -506,7 +507,7 @@ static void on_rx_err(const dwt_cb_data_t *cb) {
 
 /* --------- 定时输出 JSON：聚合收到的锚点响应并上报 --------- */
 
-static volatile uint32_t g_min_interval_ms = 500;
+static volatile uint32_t g_min_interval_ms = 2000;
 
 static volatile uint32_t g_last_tx_ms = 0;
 
@@ -517,41 +518,31 @@ static void try_flush_json(void) {
     uint32_t now = HAL_GetTick();
     if ((now - g_last_flush_ms) < g_min_interval_ms) return;
 
-    /* 是否有待上报 */
-    int has_any = 0;
-    for (int i = 0; i < MAX_ANCHORS; ++i) {
-        if (g_anchors[i].id && g_anchors[i].updated) {
-            has_any = 1;
-            break;
-        }
-    }
-    if (!has_any) {
+    /* 统计当前已知的 anchor 数 */
+    int total = 0;
+    for (int i = 0; i < MAX_ANCHORS; ++i)
+        if (g_anchors[i].id) total++;
+
+    if (total == 0) {
         g_last_flush_ms = now;
         return;
     }
 
-    /* 一次最多装这么多，避免 512 缓冲溢出 */
-    enum { MAX_ITEMS_PER_MSG = 8 };
-
-    /* JSON 缓冲 */
-    char out[512];
+    /* 更大一些的 JSON 缓冲，容纳全部 anchors */
+    char out[1536];
     size_t pos = 0;
 
-    /* 先写头 */
+    /* 头部：带 anchor_count，便于上位机校验是否完整 */
     int n = snprintf(out + pos, sizeof(out) - pos,
-                     "{\"role\":\"tag\",\"tag\":%u,\"tick\":%lu,\"anchors\":[",
-                     (unsigned) g_tag_short, (unsigned long) now);
+                     "{\"role\":\"tag\",\"tag\":%u,\"tick\":%lu,"
+                     "\"anchor_count\":%d,\"anchors\":[",
+                     (unsigned) g_tag_short, (unsigned long) now, total);
     if (n <= 0) return;
     pos += (size_t) n;
 
-    /* 收集给 app_on_tag_ranges 的数据（仍用 float，内部不打印即可） */
-    uint32_t ids[MAX_ITEMS_PER_MSG];
-    float dists[MAX_ITEMS_PER_MSG];
-    uint32_t cnt = 0;
-
     int first = 1;
-    for (int i = 0; i < MAX_ANCHORS && cnt < MAX_ITEMS_PER_MSG; ++i) {
-        if (!g_anchors[i].id || !g_anchors[i].updated) continue;
+    for (int i = 0; i < MAX_ANCHORS; ++i) {
+        if (!g_anchors[i].id) continue;
 
         /* ts -> hex10 */
         char ts_hex[11];
@@ -561,33 +552,28 @@ static void try_flush_json(void) {
         }
         ts_hex[10] = '\0';
 
-        /* 距离改整数毫米输出，避免 %f */
+        /* 距离整数毫米，避免 %f */
         long dist_mm = (long) (g_anchors[i].dist_m * 1000.0f + 0.5f);
 
         n = snprintf(out + pos, sizeof(out) - pos,
-                     "%s{\"id\":%u,\"ts\":\"%s\",\"tick\":%lu,\"dist_mm\":%ld}",
+                     "%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"ts\":\"%s\","
+                     "\"tick\":%lu,\"dist_mm\":%ld}",
                      first ? "" : ",",
-                     (unsigned) g_anchors[i].id, ts_hex,
+                     (unsigned) g_anchors[i].id,
+                     (unsigned) g_anchors[i].id,
+                     ts_hex,
                      (unsigned long) g_anchors[i].last_tick,
                      dist_mm);
         if (n <= 0) break;
 
-        /* 空间不够就提前结束，留待下次 */
+        /* 防溢出：若空间不够，提前结束（极端情况下可适当再增大缓冲区） */
         if ((size_t) n >= (sizeof(out) - pos - 2)) {
-            // 预留 "]}"
+            /* 预留 ]} */
             break;
         }
 
         pos += (size_t) n;
         first = 0;
-
-        /* 只清掉已经写入 JSON 的条目 */
-        g_anchors[i].updated = 0;
-
-        /* 给 app_on_tag_ranges 的数据 */
-        ids[cnt] = g_anchors[i].id;
-        dists[cnt] = g_anchors[i].dist_m;
-        cnt++;
     }
 
     /* 收尾 */
@@ -597,7 +583,17 @@ static void try_flush_json(void) {
 
     uart1_println(out);
 
-    /* 触发上层回调（如果需要） */
+    /* 上报给应用层：只把本次“有更新”的 anchor 通知一下，并清掉 updated */
+    uint32_t ids[16];
+    float dists[16];
+    uint32_t cnt = 0;
+    for (int i = 0; i < MAX_ANCHORS && cnt < 16; ++i) {
+        if (!g_anchors[i].id || !g_anchors[i].updated) continue;
+        ids[cnt] = g_anchors[i].id;
+        dists[cnt] = g_anchors[i].dist_m;
+        g_anchors[i].updated = 0;
+        cnt++;
+    }
     if (cnt > 0) app_on_tag_ranges(cnt, ids, dists);
 
     g_last_flush_ms = now;
@@ -648,14 +644,14 @@ static void schedule_next_final(void) {
             s_last_planned_ttx3 = t_tx3;
             s_phase = TAG_FINAL_SCHEDULED;
 
-            log_evt_t ev_ok = {
-                .type = LE_FINAL_SCHED,
-                .acr = job->anchor_id,
-                .t1 = job->t_rx2, // rx2
-                .t2 = t_tx3, // 计划的tx3
-                .gap_us = (uint32_t) DTU_TO_US_I32((t_tx3 - job->t_rx2) & TS_MASK_40)
-            };
-            log_push(&ev_ok);
+            // log_evt_t ev_ok = {
+            //     .type = LE_FINAL_SCHED,
+            //     .acr = job->anchor_id,
+            //     .t1 = job->t_rx2, // rx2
+            //     .t2 = t_tx3, // 计划的tx3
+            //     .gap_us = (uint32_t) DTU_TO_US_I32((t_tx3 - job->t_rx2) & TS_MASK_40)
+            // };
+            // log_push(&ev_ok);
             return;
         }
     }
@@ -673,27 +669,27 @@ static void schedule_next_final(void) {
             s_last_planned_ttx3 = t_tx3;
             s_phase = TAG_FINAL_SCHEDULED;
 
-            log_evt_t ev_ok = {
-                .type = LE_FINAL_SCHED,
-                .acr = job->anchor_id,
-                .t1 = job->t_rx2,
-                .t2 = t_tx3,
-                .gap_us = (uint32_t) DTU_TO_US_I32((t_tx3 - job->t_rx2) & TS_MASK_40)
-            };
-            log_push(&ev_ok);
+            // log_evt_t ev_ok = {
+            //     .type = LE_FINAL_SCHED,
+            //     .acr = job->anchor_id,
+            //     .t1 = job->t_rx2,
+            //     .t2 = t_tx3,
+            //     .gap_us = (uint32_t) DTU_TO_US_I32((t_tx3 - job->t_rx2) & TS_MASK_40)
+            // };
+            // log_push(&ev_ok);
             return;
         }
     }
 
     // --- 彻底失败：丢弃该 job，并发失败事件 ---
-    log_evt_t ev_fail = {
-        .type = LE_FINAL_SCHED_FAIL,
-        .acr = job->anchor_id,
-        .t1 = job->t_rx2,
-        .t2 = t_tx3,
-        .gap_us = (uint32_t) DTU_TO_US_I32((t_tx3 - job->t_rx2) & TS_MASK_40)
-    };
-    log_push(&ev_fail);
+    // log_evt_t ev_fail = {
+    //     .type = LE_FINAL_SCHED_FAIL,
+    //     .acr = job->anchor_id,
+    //     .t1 = job->t_rx2,
+    //     .t2 = t_tx3,
+    //     .gap_us = (uint32_t) DTU_TO_US_I32((t_tx3 - job->t_rx2) & TS_MASK_40)
+    // };
+    // log_push(&ev_fail);
 
     finalq_pop();
 }
@@ -738,6 +734,17 @@ void tag_init(void) {
 
     s_phase = TAG_IDLE; // [SESSION LOCK]
     s_tx_busy = 0;
+
+    // === tag.c: tag_init() 末尾附近
+    for (uint16_t aid = 0x0001; aid <= 0x0005; ++aid) {
+        anchor_info_t *ai = find_or_alloc_anchor(aid);
+        if (ai) {
+            ai->last_tick = 0;
+            ai->dist_m = 0;
+            ai->updated = 0;
+            memset(ai->ts, 0, 5);
+        }
+    }
 
     while (dwt_checkirq()) {
         dwt_isr(); // 把“上电遗留”的事件清掉，IRQ 线会回到低电平

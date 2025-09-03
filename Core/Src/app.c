@@ -60,10 +60,10 @@ static void draw_header(void) {
         (void) snprintf(idbuf, sizeof(idbuf), "TAG:%04X", (unsigned) tag_get_short());
         OLED_ShowString(64, 8, idbuf);
     } else if (bu03_get_role() == BU03_ROLE_ANCHOR) {
-        OLED_ShowString(0, 0, "ROLE:ACR");
+        OLED_ShowString(0, 0, "ROLE:ANC");
         OLED_ShowString(64, 0, "UWB:OK");
         char idbuf[16];
-        (void) snprintf(idbuf, sizeof(idbuf), "ACR:%04X", (unsigned) anchor_get_short());
+        (void) snprintf(idbuf, sizeof(idbuf), "ANC:%04X", (unsigned) anchor_get_short());
         OLED_ShowString(64, 8, idbuf);
     } else {
         OLED_ShowString(0, 0, "ROLE:");

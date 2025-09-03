@@ -44,11 +44,11 @@ int bu03_init(void) {
     /* 按角色初始化 */
     if (s_role == BU03_ROLE_ANCHOR) {
         /* 先随机化短地址，确保可能的首次发送前已生效 */
-        anchor_randomize_short();
+        // anchor_randomize_short();
         anchor_init();
     } else {
         /* 先随机化短地址，确保可能的首次发送前已生效 */
-        tag_randomize_short();
+        // tag_randomize_short();
         tag_init();
     }
 
@@ -71,9 +71,9 @@ void bu03_process(void) {
 void bu03_set_rate_hz(float rate) {
     s_rate_hz = rate;
     if (s_role == BU03_ROLE_ANCHOR) {
-        anchor_set_rate_hz(20.0f);
+        anchor_set_rate_hz(10);   //POLL
     } else {
-        tag_set_rate_hz(rate);
+        tag_set_rate_hz(1);      //try_flush_json
     }
 }
 

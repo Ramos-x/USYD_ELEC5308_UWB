@@ -15,6 +15,25 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
+/* ====== Anchor 时隙配置（与 Tag 共享一套参数更稳妥） ====== */
+#define ANCHOR_ID_FIRST         0x0001
+#define ANCHOR_ID_LAST          0x0005
+#define ANCHOR_SLOT_COUNT       (ANCHOR_ID_LAST - ANCHOR_ID_FIRST + 1) /* =5 */
+
+#define ANCHOR_SLOT_BASE_US     2500U   /* 槽0的 RESP 相对 POLL 的基准延迟 */
+#define ANCHOR_SLOT_SPACING_US  2000U   /* 槽与槽之间的间隔（要大于一个RESP空口时长+裕量） */
+
+/* Tag 会在收到 RESP ~2ms 后发 FINAL，Anchor 侧监听窗口要覆盖它 */
+#define TAG_FINAL_DELAY_US      2000U   /* 与 Tag 侧保持一致 */
+#define FINAL_CHAIN_GAP_US      800U    /* Tag 串行发 FINAL 的最小间隔（信息） */
+
+/* Anchor 侧 FINAL 监听窗，足以覆盖 2ms 基准 + 稍许裕量即可
+   因为我们让时隙间隔 (2000us) > FINAL_CHAIN_GAP_US (800us)，
+   Tag 不会因为“前一个 FINAL”把“后一个 FINAL”往后挤。 */
+#ifndef FINAL_WINDOW_US
+#define FINAL_WINDOW_US         4000U
+#endif
+
 
 /* ================== 时基常量 ================== */
 #ifndef DWT_TIME_UNITS
@@ -63,7 +82,7 @@ static volatile uint16_t s_resp_tag_pending = 0;
 
 /* ================== 网络参数 ================== */
 static uint16_t g_pan_id = 0xDECA;
-static uint16_t g_anchor_short = 0x5678;
+static uint16_t g_anchor_short = 0x0002;
 static const uint16_t g_broadcast_short = 0xFFFF;
 
 /* 节流：避免过快重复发 RESP（可保留） */
@@ -109,10 +128,20 @@ static void sess_clear(uint16_t tag) {
         }
 }
 
-static inline uint8_t anchor_slot_index(void) {
-    // 简单从短地址派生：0..NUM_ANCHOR_SLOTS-1
-    return (uint8_t) (g_anchor_short % NUM_ANCHOR_SLOTS);
+/* 0x0001 -> slot 0, 0x0002 -> slot 1, ... 0x0005 -> slot 4
+   超出范围的ID也能稳定落到 0..(ANCHOR_SLOT_COUNT-1) */
+static inline uint8_t anchor_slot_index_from_id(uint16_t aid)
+{
+    if (aid < ANCHOR_ID_FIRST || aid > ANCHOR_ID_LAST)
+        return (uint8_t)((aid - ANCHOR_ID_FIRST) % ANCHOR_SLOT_COUNT);
+    return (uint8_t)(aid - ANCHOR_ID_FIRST);
 }
+
+static inline uint8_t anchor_slot_index(void)
+{
+    return anchor_slot_index_from_id(g_anchor_short);
+}
+
 
 /* UART1 */
 extern UART_HandleTypeDef huart1;
@@ -158,6 +187,7 @@ void anchor_randomize_short(void) {
     // g_anchor_short = id;
     g_anchor_short = 0x0001;
 }
+
 
 uint16_t anchor_get_short(void) { return g_anchor_short; }
 
@@ -340,21 +370,21 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
         uint64_t t_rx2 = uwb_ts40_to_64(pf->t_rx2);
         uint64_t t_tx3 = uwb_ts40_to_64(pf->t_tx3);
 
-        /* 我方收到 FINAL 的时刻 T_rx3 */
-        uint8_t rxts5[5];
-        dwt_readrxtimestamp(rxts5);
-        uint64_t t_rx3 = uwb_ts40_to_64(rxts5);
+/* 我方收到 POLL 的时刻 T_rx1 */
+uint8_t rxts5[5];
+dwt_readrxtimestamp(rxts5);
+uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
 
-        /* 我方在会话里保存的 T_rx1/T_tx2 */
-        // const uint64_t TS_MASK_40 = 0xFFFFFFFFFFULL;
-        uint64_t t_rx1 = sess->t_rx1 & TS_MASK_40;
-        uint64_t t_tx2 = sess->t_tx2 & TS_MASK_40;
+/* ====== 固定时隙：基准 + 槽号×间隔 ====== */
+uint8_t slot = anchor_slot_index();
+uint32_t off_us = ANCHOR_SLOT_BASE_US + (uint32_t)slot * ANCHOR_SLOT_SPACING_US;
+uint64_t t_tx2 = (t_rx1 + US_TO_DTU(off_us)) & TS_MASK_40;
 
         /* DS-TWR：对称公式（40bit 回卷） */
-        uint64_t Tround1 = (t_rx2 - t_tx1) & TS_MASK_40; /* Tag 视角：POLL→RESP */
-        uint64_t Treply1 = (t_tx2 - t_rx1) & TS_MASK_40; /* Anchor 视角：POLL→RESP */
-        uint64_t Tround2 = (t_rx3 - t_tx2) & TS_MASK_40; /* Anchor 视角：RESP→FINAL */
-        uint64_t Treply2 = (t_tx3 - t_rx2) & TS_MASK_40; /* Tag 视角：RESP→FINAL */
+        // uint64_t Tround1 = (t_rx2 - t_tx1) & TS_MASK_40; /* Tag 视角：POLL→RESP */
+        // uint64_t Treply1 = (t_tx2 - t_rx1) & TS_MASK_40; /* Anchor 视角：POLL→RESP */
+        // uint64_t Tround2 = (t_rx3 - t_tx2) & TS_MASK_40; /* Anchor 视角：RESP→FINAL */
+        // uint64_t Treply2 = (t_tx3 - t_rx2) & TS_MASK_40; /* Tag 视角：RESP→FINAL */
 
         // /* 常用近似：ToF = ((Tround1 - Treply1) + (Tround2 - Treply2))/4 */
         // double tof_dtu = 0.25 * ((double) ((int64_t) Tround1 - (int64_t) Treply1)
@@ -374,25 +404,34 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         // ---- 差值与 ToF（DTU）----
-        int64_t d1 = (int64_t) ((Tround1 - Treply1) & TS_MASK_40);
-        int64_t d2 = (int64_t) ((Tround2 - Treply2) & TS_MASK_40);
-        int64_t tof_dtu_i64 = (d1 + d2) / 4;
-        if (tof_dtu_i64 < 0) tof_dtu_i64 = 0;
+        // int64_t d1 = (int64_t) ((Tround1 - Treply1) & TS_MASK_40);
+        // int64_t d2 = (int64_t) ((Tround2 - Treply2) & TS_MASK_40);
+        // int64_t tof_dtu_i64 = (d1 + d2) / 4;
+        // if (tof_dtu_i64 < 0) tof_dtu_i64 = 0;
 
-        // 32 位展示值（足够）
-        int32_t d1_ns = DTU_TO_NS_I32(d1);
-        int32_t d2_ns = DTU_TO_NS_I32(d2);
-        int32_t tof_ns = DTU_TO_NS_I32(tof_dtu_i64);
-        int32_t dist_mm = DTU_TO_MM_I32(tof_dtu_i64);
+        // // 32 位展示值（足够）
+        // int32_t d1_ns = DTU_TO_NS_I32(d1);
+        // int32_t d2_ns = DTU_TO_NS_I32(d2);
+        // int32_t tof_ns = DTU_TO_NS_I32(tof_dtu_i64);
+        // int32_t dist_mm = DTU_TO_MM_I32(tof_dtu_i64);
+        //
+        // uart1_printf("[FINAL] tag=%u d1=%ldDTU(%ldns) d2=%ldDTU(%ldns) "
+        //              "ToF=%ldDTU(%ldns) dist=%ld.%03ldm",
+        //              (unsigned) tag_id,
+        //              (long) d1, (long) d1_ns,
+        //              (long) d2, (long) d2_ns,
+                     // (long) tof_dtu_i64, (long) tof_ns,
+                     // (long) (dist_mm / 1000), (long) labs(dist_mm % 1000));
 
-        uart1_printf("[FINAL] tag=%u d1=%ldDTU(%ldns) d2=%ldDTU(%ldns) "
-                     "ToF=%ldDTU(%ldns) dist=%ld.%03ldm",
-                     (unsigned) tag_id,
-                     (long) d1, (long) d1_ns,
-                     (long) d2, (long) d2_ns,
-                     (long) tof_dtu_i64, (long) tof_ns,
-                     (long) (dist_mm / 1000), (long) labs(dist_mm % 1000));
-
+        {
+            char rx1_hex[11], plan_hex[11];
+            ts40_to_hex(rx1_hex, t_rx1);
+            ts40_to_hex(plan_hex, t_tx2);
+            uart1_printf("[POLL] tag=%u seq=%u slot=%u off_us=%lu rx1=0x%s plan_tx2=0x%s",
+                         (unsigned)tag_id, (unsigned)v.hdr->seq,
+                         (unsigned)slot, (unsigned long)off_us,
+                         rx1_hex, plan_hex);
+        }
 
         return;
     }
@@ -418,8 +457,8 @@ static void uart1_printf(const char *fmt, ...) {
 void anchor_set_rate_hz(float rate) {
     if (rate < 0.1f) rate = 0.1f;
     if (rate > 100.0f) rate = 100.0f;
-    // g_min_interval_ms = (uint32_t) (1000.0f / rate + 0.5f);
-    g_min_interval_ms = (uint32_t) (0);
+    g_min_interval_ms = (uint32_t) (1000.0f / rate + 0.5f);
+    // g_min_interval_ms = (uint32_t) (0);
 }
 
 void anchor_init(void) {

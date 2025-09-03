@@ -1,0 +1,73 @@
+{
+  "schema": "uwb.ds-twr@1",
+  "epoch_id": "169d1a2e-1a2b-4f2c-9f01-00000001",
+  "tag": {
+    "id": 10,
+    "fw": "tag-fw-1.0.0",
+    "tick_ms": 12345
+  },
+  "radio": {
+    "chan": 5,
+    "prf": 64,
+    "datarate": "6M8",
+    "preamble": 128,
+    "sfd": "DW",
+    "antdelay_tx": 16456,
+    "antdelay_rx": 16456
+  },
+  "time_base": {
+    "unit": "dtu",
+    "dtu_per_second": 6389760000,
+    "wrap_bits": 40
+  },
+  "poll": {
+    "seq": 42,
+    "t_tx1_hex": "1A2B3C4D5E",
+    "t_tx1_dtu": 112233445566
+  },
+  "anchors": [
+    {
+      "aid": 1,
+      "slot": 0,
+      "resp": {
+        "t_rx2_hex": "052E7C51F4",
+        "t_rx2_dtu": 222233334444,
+        "a_rx1_hex": "052E6F1201",
+        "a_tx2_hex": "05361A51F4"
+      },
+      "final": {
+        "t_tx3_plan_hex": "05361A51F4",
+        "t_tx3_real_hex": "05361A9015"
+      },
+      "anc_report": {
+        "a_rx3_hex": null,
+        "range_mm": null
+      },
+      "quality": {
+        "rssi_dbm": -84.3,
+        "fp_power_dbm": -88.1,
+        "std_noise": 101,
+        "fpi": 8019
+      }
+    },
+    {
+      "aid": 2,
+      "slot": 1,
+      "resp": {
+        "t_rx2_hex": "5939EDAD70",
+        "t_rx2_dtu": 333344445555,
+        "a_rx1_hex": "5939E50110",
+        "a_tx2_hex": "59418BAD70"
+      },
+      "final": {
+        "t_tx3_plan_hex": "59418BAD70",
+        "t_tx3_real_hex": "59418BEC15"
+      },
+      "anc_report": {
+        "a_rx3_hex": null,
+        "range_mm": null
+      },
+      "quality": null
+    }
+  ]
+}
