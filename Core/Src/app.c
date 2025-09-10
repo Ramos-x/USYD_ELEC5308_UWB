@@ -320,9 +320,6 @@ void app_process(void) {
     /* UWB 处理（中断与协议驱动） */
     bu03_process();
 
-    /* 轻量延时，配合回调驱动 */
-    HAL_Delay(1);
-
     /* LED_RUN */
     static uint32_t s_last_run_ms = 0;
     const uint32_t now = HAL_GetTick();

@@ -143,31 +143,6 @@ static inline uint8_t anchor_slot_index(void)
 }
 
 
-/* UART1 */
-extern UART_HandleTypeDef huart1;
-
-static void uart1_println(const char *s) {
-    size_t n = strlen(s);
-    HAL_UART_Transmit(&huart1, (uint8_t *) s, (uint16_t) n, 100);
-    const char crlf[2] = {'\r', '\n'};
-    HAL_UART_Transmit(&huart1, (uint8_t *) crlf, 2, 100);
-}
-
-// static void print_anchor_json_uintmm(uint16_t tag_id, uint16_t acr, float dist_m) {
-//     if (dist_m < 0) dist_m = 0;
-//     long mm = (long) (dist_m * 1000.0f + 0.5f); // 四舍五入到毫米
-//     long ip = mm / 1000; // 整数部分（米）
-//     long fp = mm % 1000;
-//     if (fp < 0) fp = -fp; // 小数部分（3位）
-//
-//     char out[128];
-//     // 这里全是整数格式，不需要 %f 支持
-//     snprintf(out, sizeof(out),
-//              "{\"role\":\"anchor\",\"tag\":%u,\"acr\":%u,\"dist\":%ld.%03ld}",
-//              (unsigned) tag_id, (unsigned) acr, ip, fp);
-//     uart1_println(out);
-// }
-
 /* ========== 地址工具 ========== */
 /* 基于芯片唯一ID生成16位短地址，保证不同设备不会重复 */
 void anchor_randomize_short(void) {
