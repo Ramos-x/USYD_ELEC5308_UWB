@@ -1,21 +1,3 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-
 #include "main.h"
 
 #include <stdbool.h>
@@ -24,15 +6,24 @@
 #include "OLED/oled.h"
 #include "UWB/uwb.h"
 
+
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
+
 SPI_HandleTypeDef hspi1;
+
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
+DMA_HandleTypeDef hdma_usart1_tx;
+
 PCD_HandleTypeDef hpcd_USB_FS;
+
 
 void SystemClock_Config(void);
 
 static void MX_GPIO_Init(void);
+
+static void MX_DMA_Init(void);
 
 static void MX_I2C1_Init(void);
 
@@ -44,15 +35,34 @@ static void MX_USART1_UART_Init(void);
 
 static void MX_USB_PCD_Init(void);
 
-
 /**
   * @brief  The application entry point.
-  * @retval Int
+  * @retval int
   */
 int main(void) {
+    /* USER CODE BEGIN 1 */
+
+    /* USER CODE END 1 */
+
+    /* MCU Configuration--------------------------------------------------------*/
+
+    /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
     HAL_Init();
+
+    /* USER CODE BEGIN Init */
+
+    /* USER CODE END Init */
+
+    /* Configure the system clock */
     SystemClock_Config();
+
+    /* USER CODE BEGIN SysInit */
+
+    /* USER CODE END SysInit */
+
+    /* Initialize all configured peripherals */
     MX_GPIO_Init();
+    MX_DMA_Init();
     MX_I2C1_Init();
     MX_I2C2_Init();
     MX_SPI1_Init();
@@ -219,7 +229,7 @@ static void MX_USART1_UART_Init(void) {
 
     /* USER CODE END USART1_Init 1 */
     huart1.Instance = USART1;
-    huart1.Init.BaudRate = 200000;
+    huart1.Init.BaudRate = 2000000;
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
     huart1.Init.StopBits = UART_STOPBITS_1;
     huart1.Init.Parity = UART_PARITY_NONE;
@@ -262,6 +272,22 @@ static void MX_USB_PCD_Init(void) {
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void) {
+    /* DMA controller clock enable */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    /* DMA interrupt init */
+    /* DMA1_Channel4_IRQn interrupt configuration */
+    HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+    /* DMA1_Channel5_IRQn interrupt configuration */
+    HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -286,9 +312,9 @@ static void MX_GPIO_Init(void) {
                              | SPI1_CSN_Pin | EXTON_Pin | PA15_Pin, GPIO_PIN_RESET);
 
     /*Configure GPIO pin Output Level */
-    HAL_GPIO_WritePin(GPIOB, DW_WAKEUP_Pin | DW_SYNC_Pin | PB12_Pin | PB13_Pin
-                             | PB14_Pin | PB15_Pin | PB3_Pin | PB4_Pin
-                             | PB8_Pin | PB9_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, DW_WAKEUP_Pin | PB12_Pin | PB13B13_Pin | PB14_Pin
+                             | PB15_Pin | PB3_Pin | PB4_Pin | PB8_Pin
+                             | PB9_Pin, GPIO_PIN_RESET);
 
     /*Configure GPIO pin : PB13_Pin */
     GPIO_InitStruct.Pin = PB13_Pin;
@@ -306,6 +332,7 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+    ///////////////////////////////
     /*Configure GPIO pins : DW_WAKEUP_Pin DW_SYNC_Pin PB12_Pin PB13_Pin
                              PB14_Pin PB15_Pin PB3_Pin PB4_Pin
                              PB8_Pin PB9_Pin */
@@ -339,12 +366,8 @@ static void MX_GPIO_Init(void) {
     /* 使能 EXTI9_5 中断 */
     HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-
-
-    /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-    /* USER CODE END MX_GPIO_Init_2 */
 }
+
 
 /* USER CODE BEGIN 4 */
 /* 应用回调与显示逻辑已迁移至 app.c */

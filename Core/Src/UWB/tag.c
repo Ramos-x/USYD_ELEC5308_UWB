@@ -14,6 +14,17 @@
 
 #include <stdarg.h>
 #include <stdlib.h>
+
+extern UART_HandleTypeDef huart1;
+
+/* ===== UART1 TX 环形缓冲 + DMA 状态 ===== */
+#define UART1_TX_BUF_SZ  2048  // 可按需要调整为 512/1024/4096 等
+static uint8_t uart1_tx_buf[UART1_TX_BUF_SZ];
+static volatile uint16_t tx_head = 0; // 写指针
+static volatile uint16_t tx_tail = 0; // 读指针(下次DMA从这里取)
+static volatile uint16_t dma_chunk_len = 0; // 本次DMA发送的长度
+static volatile uint8_t dma_busy = 0; // 1=DMA正在发送
+
 /* 距离换算常量（DW 时基） */
 #ifndef DWT_TIME_UNITS
 #define DWT_TIME_UNITS (1.0/ (499.2e6 * 128.0))
@@ -53,6 +64,113 @@
 #ifndef RESP_WINDOW_US
 #define RESP_WINDOW_US  8000U   /* 示例：6 ms；按你的时隙参数调整 */
 #endif
+
+///////////////////// UART.DMA
+static inline uint16_t uart1_tx_used(void) {
+    uint16_t h = tx_head, t = tx_tail;
+    return (h >= t) ? (h - t) : (uint16_t) (UART1_TX_BUF_SZ - (t - h));
+}
+
+static inline uint16_t uart1_tx_free(void) {
+    // 预留1字节避免满缓冲与空缓冲的指针相等问题
+    return (uint16_t) (UART1_TX_BUF_SZ - 1 - uart1_tx_used());
+}
+
+static void uart1_kick_dma_if_idle(void) {
+    if (dma_busy) return;
+
+    uint16_t used = uart1_tx_used();
+    if (used == 0) return;
+
+    // 这次只能发“tail 到 缓冲末尾”的连续一段，避免跨环
+    uint16_t contiguous = (tx_head >= tx_tail)
+                              ? (tx_head - tx_tail)
+                              : (uint16_t) (UART1_TX_BUF_SZ - tx_tail);
+
+    dma_chunk_len = contiguous;
+    dma_busy = 1;
+
+    // 从 tx_tail 起发出 contiguous 字节
+    if (HAL_UART_Transmit_DMA(&huart1, &uart1_tx_buf[tx_tail], dma_chunk_len) != HAL_OK) {
+        // 启动失败就复位状态，避免卡死
+        dma_busy = 0;
+        dma_chunk_len = 0;
+    }
+}
+
+static void uart1_write_bytes(const uint8_t *data, uint16_t len) {
+    while (len) {
+        __disable_irq();
+        uint16_t free = uart1_tx_free();
+        __enable_irq();
+
+        if (free == 0) {
+            // 没空间：这里简单忙等；如需“永不阻塞”，可选择丢弃或返回
+            continue;
+        }
+
+        uint16_t chunk = (len < free) ? len : free;
+
+        // 把 chunk 字节拷贝进环形缓冲，从 head 开始，可能分两段
+        uint16_t first = (uint16_t) (UART1_TX_BUF_SZ - tx_head);
+        if (first > chunk) first = chunk;
+
+        memcpy(&uart1_tx_buf[tx_head], data, first);
+        tx_head = (uint16_t) ((tx_head + first) % UART1_TX_BUF_SZ);
+
+        uint16_t remain = (uint16_t) (chunk - first);
+        if (remain) {
+            memcpy(&uart1_tx_buf[tx_head], data + first, remain);
+            tx_head = (uint16_t) ((tx_head + remain) % UART1_TX_BUF_SZ);
+        }
+
+        data += chunk;
+        len -= chunk;
+
+        // 尝试启动 DMA
+        __disable_irq();
+        uart1_kick_dma_if_idle();
+        __enable_irq();
+    }
+}
+
+////////
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart != &huart1) return;
+
+    // 把刚刚发掉的那段从环里“消费”掉
+    tx_tail = (uint16_t) ((tx_tail + dma_chunk_len) % UART1_TX_BUF_SZ);
+    dma_chunk_len = 0;
+
+    // 还有数据就立刻继续发下一段；否则标记空闲
+    if (uart1_tx_used() > 0) {
+        dma_busy = 0; // 先置空闲，再尝试启动
+        uart1_kick_dma_if_idle(); // 会把 dma_busy 重新置 1
+    } else {
+        dma_busy = 0;
+    }
+}
+
+/* —— 非阻塞 printf：写环形缓冲，让 DMA 去发 —— */
+/* 返回写入的字节数（不含CRLF）；若在中断里调用请谨慎使用vsnprintf（见下方说明） */
+static void uart1_printf(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    /* 预留 2 字节给 CRLF，避免溢出 */
+    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    va_end(ap);
+
+    if (n <= 0) return;
+    if (n > (int) (sizeof(buf) - 2)) n = (int) (sizeof(buf) - 2);
+
+    /* 写入环形缓冲（可能被分成两段），DMA 空闲时会被自动拉起 */
+    uart1_write_bytes((const uint8_t *) buf, (uint16_t) n);
+
+    /* 追加 CRLF */
+    static const uint8_t crlf[2] = {'\r', '\n'};
+    uart1_write_bytes(crlf, 2);
+}
 
 static void ts40_to_hex(char out[11], uint64_t ts40) {
     // 40bit 小端->HEX（高位在前）
@@ -196,9 +314,6 @@ static inline void finalq_pop(void) {
 
 
 /* 40bit上取最大值（t 是 40bit 环形计数）*/
-
-#define TS_MASK_40 0xFFFFFFFFFFULL
-
 static inline int after40(uint64_t a, uint64_t b) {
     /* a 在 b 之后，当且仅当 (a-b) 的 40bit 差值 < 半量程 */
     return (((a - b) & TS_MASK_40) < (1ULL << 39));
@@ -212,9 +327,6 @@ static inline uint64_t max40(uint64_t a, uint64_t b) {
 
 static volatile uint64_t g_last_poll_tx_ts = 0;
 
-/* UART1 由 CubeMX 生成于 main.c */
-
-extern UART_HandleTypeDef huart1;
 
 /* 网络参数：PAN 与短地址（示例值，可按需修改） */
 
@@ -289,11 +401,11 @@ static inline char hex4(uint8_t v) {
 
 /* UART 输出一行 */
 
+/* —— 非阻塞 println：写环形缓冲，让 DMA 去发 —— */
 static void uart1_println(const char *s) {
-    size_t n = strlen(s);
-    HAL_UART_Transmit(&huart1, (uint8_t *) s, (uint16_t) n, 100);
-    const char crlf[2] = {'\r', '\n'};
-    HAL_UART_Transmit(&huart1, (uint8_t *) crlf, 2, 100);
+    uart1_write_bytes((const uint8_t *) s, (uint16_t) strlen(s));
+    static const uint8_t crlf[2] = {'\r', '\n'};
+    uart1_write_bytes(crlf, 2);
 }
 
 /* ========== 用户回调 ========== */
@@ -599,19 +711,6 @@ static void try_flush_json(void) {
     g_last_flush_ms = now;
 }
 
-
-static void uart1_printf(const char *fmt, ...) {
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n <= 0) return;
-    HAL_UART_Transmit(&huart1, (uint8_t *) buf, (uint16_t) n, 100);
-    const char crlf[2] = {'\r', '\n'};
-    HAL_UART_Transmit(&huart1, (uint8_t *) crlf, 2, 100);
-}
-
 void tag_set_rate_hz(float rate) {
     if (rate < 0.1f) rate = 0.1f;
     if (rate > 100.0f) rate = 100.0f;
@@ -753,6 +852,6 @@ void tag_init(void) {
 
 void tag_process(void) {
     uwb_periodic_task();
-    log_flush(); // <<<<<< 新增：统一输出日志
-    try_flush_json(); // 你的聚合 JSON（注意避免 %f）
+    log_flush();
+    try_flush_json();
 }
