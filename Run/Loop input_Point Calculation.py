@@ -1,7 +1,8 @@
 import json
 import numpy as np
 import serial
-
+import threading
+import time
 
 # --- Your existing functions remain here, no changes needed ---
 def hex_to_dtu(hex_str):
@@ -67,49 +68,71 @@ def solve_multilateration(known_points, distances):
     
     return calculated_position
 
+# --- New Global variables for thread communication ---
+latest_data = None
+lock = threading.Lock()
+stop_thread = threading.Event()
+
+# --- New Function: Thread for reading serial data ---
+def serial_reader_thread(ser):
+    """Continuously reads data from the serial port in a separate thread."""
+    global latest_data
+    while not stop_thread.is_set():
+        line = ser.readline()
+        if line:
+            try:
+                json_data_string = line.decode('utf-8').strip()
+                if json_data_string:
+                    # Parse the data
+                    data = json.loads(json_data_string)
+                    # Use a lock to safely update the shared variable
+                    with lock:
+                        latest_data = data
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                print(f"Reader Thread Error: Invalid data format received: {e}")
+
 # --- Main execution loop for UART input ---
 def main():
-    # Configure and open the serial port
-    # Adjust 'COM3' to your serial port and 9600 to your baud rate.
-    # The 'timeout' parameter prevents the program from hanging indefinitely.
-    # 
+    global latest_data
     
+    # Configure and open the serial port
     try:
-        # Replace 'COM3' with your actual serial port name.
-        ser = serial.Serial('COM3', baudrate=115200, timeout=1) 
+        ser = serial.Serial('Forest5', baudrate=2000000, timeout=1) 
         print(f"Listening for JSON data on {ser.name} at {ser.baudrate} bps...")
-        
-        # NOTE: You must provide the known coordinates for your anchors here.
-        # These are placeholder values.
-        known_anchor_coords = [
-            np.array([0.0, 0.0, 0.0]),
-            np.array([20.0, 0.0, 5.0]),
-            np.array([0.0, 20.0, 10.0]),
-            np.array([-10.0, -10.0, 2.0]),
-            np.array([15.0,-5.0,12.0])
-        ]
-        
+    except serial.SerialException as e:
+        print(f"Error: Could not open serial port. Please check your port name and connection. Details: {e}")
+        return
+
+    # NOTE: You must provide the known coordinates for your anchors here.
+    known_anchor_coords = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([20.0, 0.0, 5.0]),
+        np.array([0.0, 20.0, 10.0]),
+        np.array([-10.0, -10.0, 2.0]),
+        np.array([15.0, -5.0, 12.0])
+    ]
+
+    # Start the serial reader thread
+    reader_thread = threading.Thread(target=serial_reader_thread, args=(ser,), daemon=True)
+    reader_thread.start()
+
+    try:
         while True:
-            # Read a line from the serial port.
-            # `readline()` blocks until a newline character is received.
-            line = ser.readline()
-            if line:
+            # Main thread waits for a specified interval
+            time.sleep(5)
+            
+            # Use a lock to safely read the shared variable
+            with lock:
+                current_data = latest_data
+                latest_data = None # Reset to process next set of data
+
+            if current_data:
                 try:
-                    # Decode the line from bytes to a string
-                    json_data_string = line.decode('utf-8').strip()
-                    
-                    # Ensure the line isn't empty after stripping whitespace
-                    if not json_data_string:
-                        continue
-                    
-                    # --- Your existing logic, now in a loop ---
-                    data = json.loads(json_data_string)
+                    poll_tx1_dtu = current_data['poll']['t_tx1_dtu']
+                    dtu_per_second = current_data['time_base']['dtu_per_second']
+                    anchors_data = current_data['anchors']
 
-                    poll_tx1_dtu = data['poll']['t_tx1_dtu']
-                    dtu_per_second = data['time_base']['dtu_per_second']
-                    anchors_data = data['anchors']
-
-                    print(f"\n--- New Data Packet Received ---")
+                    print(f"\n--- Processing Data Packet ---")
                     print(f"Poll TX1 DTU: {poll_tx1_dtu}")
                     print(f"DTU per Second: {dtu_per_second}")
                     
@@ -121,19 +144,18 @@ def main():
                             distance = calculate_tof_and_distance(poll_tx1_dtu, anchor, dtu_per_second)
                             distances.append(distance)
                             # Get the corresponding anchor coordinates based on its aid
-                            anchor_coord_index = anchor['aid'] - 1 # assuming aida are 1-based
+                            anchor_coord_index = anchor['aid'] - 1 
                             if anchor_coord_index < len(known_anchor_coords):
                                 valid_anchors.append(known_anchor_coords[anchor_coord_index])
                                 print(f"Distance to Anchor {anchor['aid']}: {distance:.2f} meters")
                             else:
                                 print(f"Warning: No known coordinates for Anchor {anchor['aid']}.")
-                                distances.pop() # remove invalid distance
+                                distances.pop()
                                 continue
                         except Exception as e:
                             print(f"Could not calculate distance for Anchor {anchor['aid']}: {e}")
                             distances.append(None)
 
-                    # Filter out any None values from the list
                     valid_distances = [d for d in distances if d is not None]
 
                     if len(valid_distances) >= 4:
@@ -142,18 +164,18 @@ def main():
                         print(f"Calculated Position: ({calculated_position[0]:.2f}, {calculated_position[1]:.2f}, {calculated_position[2]:.2f})")
                     else:
                         print("\nNot enough valid anchor data (at least 4 are needed) to perform 3D multilateration.")
-
-                except json.JSONDecodeError:
-                    print(f"Error: Invalid JSON format received: {line.decode('utf-8').strip()}")
+                        
                 except Exception as e:
                     print(f"An error occurred during processing: {e}")
-
-    except serial.SerialException as e:
-        print(f"Error: Could not open serial port. Please check your port name and connection. Details: {e}")
+            else:
+                print("\nNo new data received in the last 10 seconds.")
+                
     except KeyboardInterrupt:
         print("Program terminated by user.")
     finally:
-        if 'ser' in locals() and ser.is_open:
+        # Signal the reader thread to stop
+        stop_thread.set()
+        if ser.is_open:
             ser.close()
             print("Serial port closed.")
 
