@@ -323,10 +323,10 @@ void app_process(void) {
     /* LED_RUN */
     static uint32_t s_last_run_ms = 0;
     const uint32_t now = HAL_GetTick();
-    if (now - s_last_run_ms >= 500U) {
+    if (now - s_last_run_ms >= 1000U) {
         HAL_GPIO_WritePin(LED_RUN_GPIO_Port, LED_RUN_Pin, GPIO_PIN_SET);
         s_last_run_ms = now;
-    } else if (now - s_last_run_ms == 8U) {
-        HAL_GPIO_TogglePin(LED_RUN_GPIO_Port, LED_RUN_Pin);
+    } else if (now - s_last_run_ms == 40U) {
+        HAL_GPIO_WritePin(LED_RUN_GPIO_Port, LED_RUN_Pin, GPIO_PIN_RESET);
     }
 }

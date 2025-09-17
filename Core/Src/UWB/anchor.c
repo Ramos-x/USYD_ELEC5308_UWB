@@ -20,8 +20,8 @@
 #define ANCHOR_ID_LAST          0x0005
 #define ANCHOR_SLOT_COUNT       (ANCHOR_ID_LAST - ANCHOR_ID_FIRST + 1) /* =5 */
 
-#define ANCHOR_SLOT_BASE_US     2500U   /* 槽0的 RESP 相对 POLL 的基准延迟 */
-#define ANCHOR_SLOT_SPACING_US  2000U   /* 槽与槽之间的间隔（要大于一个RESP空口时长+裕量） */
+#define ANCHOR_SLOT_BASE_US     2500U   /* 槽0 RESP 相对 POLL 的基准延迟（与 Tag 对齐） */
+#define ANCHOR_SLOT_SPACING_US  2000U   /* 槽间隔（与 Tag 对齐） */
 
 /* Tag 会在收到 RESP ~2ms 后发 FINAL，Anchor 侧监听窗口要覆盖它 */
 #define TAG_FINAL_DELAY_US      2000U   /* 与 Tag 侧保持一致 */
@@ -64,9 +64,9 @@
 #define DTU_TO_MM_I64(dtu64) ((int64_t)((double)(dtu64)*DWT_TIME_UNITS*SPEED_OF_LIGHT*1000.0 + 0.5))
 #endif
 
-#define TS_MASK_40 0xFFFFFFFFFFULL
-#define ANCHOR_REPLY_BASE_US     2500U      // 基准(首个Anchor)的延迟
-#define ANCHOR_SLOT_SPACING_US   2000U      // 邻近两个Anchor之间的时隙间隔
+// #define TS_MASK_40 0xFFFFFFFFFFULL
+#define ANCHOR_REPLY_BASE_US     2500U      // 基准(首个Anchor)的延迟（实际使用）
+#define ANCHOR_SLOT_SPACING_US   2000U      // 邻近两个Anchor之间的时隙间隔（实际使用）
 #define NUM_ANCHOR_SLOTS         4          // 先给够，后面想扩到更多Anchor也行
 static volatile uint8_t s_sending_resp = 0;
 static volatile uint16_t s_resp_tag_pending = 0;
@@ -82,8 +82,8 @@ extern UART_HandleTypeDef huart1;
 #endif
 
 /* ================== 网络参数 ================== */
-static uint16_t g_pan_id = 0xDECA;
-static uint16_t g_anchor_short = 0x0002;
+static uint16_t g_pan_id = 0xABCD;
+static uint16_t g_addr_short = 0x0002;
 static const uint16_t g_broadcast_short = 0xFFFF;
 
 /* 节流：避免过快重复发 RESP（可保留） */
@@ -140,32 +140,18 @@ static inline uint8_t anchor_slot_index_from_id(uint16_t aid)
 
 static inline uint8_t anchor_slot_index(void)
 {
-    return anchor_slot_index_from_id(g_anchor_short);
+    return anchor_slot_index_from_id(g_addr_short);
 }
 
 
 /* ========== 地址工具 ========== */
 /* 基于芯片唯一ID生成16位短地址，保证不同设备不会重复 */
 void anchor_randomize_short(void) {
-    uint32_t u0 = HAL_GetUIDw0(), u1 = HAL_GetUIDw1(), u2 = HAL_GetUIDw2();
-    uint32_t mix = 2166136261u;
-    mix ^= u0;
-    mix *= 16777619u;
-    mix ^= u1;
-    mix *= 16777619u;
-    mix ^= u2;
-    mix *= 16777619u;
-    uint16_t id = (uint16_t) ((mix ^ (mix >> 16)) & 0xFFFFu);
-    if (id == 0x0000u || id == 0xFFFFu || id == g_broadcast_short) {
-        id ^= 0xA5A5u;
-        if (id == 0x0000u || id == 0xFFFFu) id ^= 0x1D0Fu;
-    }
-    // g_anchor_short = id;
-    g_anchor_short = 0x0001;
+    g_addr_short = 0x0001;
 }
 
 
-uint16_t anchor_get_short(void) { return g_anchor_short; }
+uint16_t anchor_get_short(void) { return g_addr_short; }
 
 static void ts40_to_hex(char out[11], uint64_t ts40) {
     // 40bit 小端->HEX（高位在前）
@@ -287,7 +273,7 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
                                           (uint8_t) (v.hdr->seq + 1), /* RESP 的序号 */
                                           v.hdr->pan,
                                           tag_id, /* dest = tag   */
-                                          g_anchor_short, /* src  = anchor*/
+                                          g_addr_short, /* src  = anchor*/
                                           t_rx1, t_tx2);
 
         if (dwt_writetxdata(mac_len, txbuf, 0) == DWT_SUCCESS) {
@@ -351,9 +337,9 @@ uint8_t rxts5[5];
 dwt_readrxtimestamp(rxts5);
 uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
 
-/* ====== 固定时隙：基准 + 槽号×间隔 ====== */
+/* ====== 固定时隙：基准 + 槽号×间隔（与 RESP 计算一致） ====== */
 uint8_t slot = anchor_slot_index();
-uint32_t off_us = ANCHOR_SLOT_BASE_US + (uint32_t)slot * ANCHOR_SLOT_SPACING_US;
+uint32_t off_us = ANCHOR_REPLY_BASE_US + (uint32_t)slot * ANCHOR_SLOT_SPACING_US;
 uint64_t t_tx2 = (t_rx1 + US_TO_DTU(off_us)) & TS_MASK_40;
 
         /* DS-TWR：对称公式（40bit 回卷） */
@@ -439,10 +425,10 @@ void anchor_set_rate_hz(float rate) {
 
 void anchor_init(void) {
     dwt_setpanid(g_pan_id);
-    dwt_setaddress16(g_anchor_short);
+    dwt_setaddress16(g_addr_short);
 
     char buf[16];
-    snprintf(buf, sizeof(buf), "ACR:%04X", (unsigned) g_anchor_short);
+    snprintf(buf, sizeof(buf), "ACR:%04X", (unsigned) g_addr_short);
     OLED_ShowString(0, 8, buf);
 
     dwt_setcallbacks(on_tx_done, on_rx_ok, on_rx_to, on_rx_err, NULL, NULL);

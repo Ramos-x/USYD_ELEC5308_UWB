@@ -42,7 +42,7 @@ void OLED_SetContrast(uint8_t contrast) {
     oled_write_cmd(contrast);
 }
 
-void OLED_Init(I2C_HandleTypeDef* hi2c) {
+void OLED_Init(I2C_HandleTypeDef *hi2c) {
     s_hi2c = hi2c;
     HAL_Delay(100);
 

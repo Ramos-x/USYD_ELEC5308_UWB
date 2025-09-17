@@ -62,7 +62,7 @@ static volatile uint8_t dma_busy = 0; // 1=DMA正在发送
 
 /* 本轮 RESP 监听窗口（应覆盖 Anchor 的整个时隙窗 + 余量） */
 #ifndef RESP_WINDOW_US
-#define RESP_WINDOW_US  8000U   /* 示例：6 ms；按你的时隙参数调整 */
+#define RESP_WINDOW_US  8000U
 #endif
 
 ///////////////////// UART.DMA
@@ -105,9 +105,11 @@ static void uart1_write_bytes(const uint8_t *data, uint16_t len) {
         __enable_irq();
 
         if (free == 0) {
-            // 没空间：这里简单忙等；如需“永不阻塞”，可选择丢弃或返回
+            __enable_irq();
+            HAL_Delay(0); // 或 osThreadYield()
             continue;
         }
+
 
         uint16_t chunk = (len < free) ? len : free;
 
@@ -150,6 +152,14 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
         dma_busy = 0;
     }
 }
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart){
+    if (huart == &huart1){
+        dma_busy = 0;
+        dma_chunk_len = 0;
+        // 让下一轮能被拉起
+        uart1_kick_dma_if_idle();
+    }
+}
 
 /* —— 非阻塞 printf：写环形缓冲，让 DMA 去发 —— */
 /* 返回写入的字节数（不含CRLF）；若在中断里调用请谨慎使用vsnprintf（见下方说明） */
@@ -172,13 +182,16 @@ static void uart1_printf(const char *fmt, ...) {
     uart1_write_bytes(crlf, 2);
 }
 
-static void ts40_to_hex(char out[11], uint64_t ts40) {
-    // 40bit 小端->HEX（高位在前）
-    uint8_t b[5];
-    for (int i = 0; i < 5; ++i) b[i] = (uint8_t) ((ts40 >> (8 * i)) & 0xFF);
-    for (int i = 0; i < 5; ++i) sprintf(out + 2 * i, "%02X", b[4 - i]);
-    out[10] = '\0';
+static const char HEX[]="0123456789ABCDEF";
+static void ts40_to_hex(char out[11], uint64_t ts){
+    for(int i=0;i<5;i++){
+        uint8_t b = (ts>>(8*(4-i))) & 0xFF; // 高位在前
+        out[i*2]   = HEX[b>>4];
+        out[i*2+1] = HEX[b&0xF];
+    }
+    out[10]='\0';
 }
+
 
 /* ---------- 日志事件队列（ISR->主循环） ---------- */
 typedef enum {
@@ -330,7 +343,7 @@ static volatile uint64_t g_last_poll_tx_ts = 0;
 
 /* 网络参数：PAN 与短地址（示例值，可按需修改） */
 
-static uint16_t g_pan_id = 0xDECA;
+static uint16_t g_pan_id = 0xABCD;
 
 static uint16_t g_tag_short = 0x1234;
 
@@ -339,24 +352,6 @@ static const uint16_t g_broadcast_short = 0xFFFF;
 /* 基于芯片唯一ID生成16位短地址，保证不同设备不会重复 */
 
 void tag_randomize_short(void) {
-    uint32_t u0 = HAL_GetUIDw0();
-    uint32_t u1 = HAL_GetUIDw1();
-    uint32_t u2 = HAL_GetUIDw2();
-
-    uint32_t mix = 2166136261u;
-    mix ^= u0;
-    mix *= 16777619u;
-    mix ^= u1;
-    mix *= 16777619u;
-    mix ^= u2;
-    mix *= 16777619u;
-
-    uint16_t id = (uint16_t) ((mix ^ (mix >> 16)) & 0xFFFFu);
-    if (id == 0x0000u || id == 0xFFFFu || id == g_broadcast_short) {
-        id ^= 0xA5A5u;
-        if (id == 0x0000u || id == 0xFFFFu) id ^= 0x1D0Fu;
-    }
-    // g_tag_short = id;
     g_tag_short = 0x000A;
 }
 
@@ -420,7 +415,7 @@ static volatile tag_phase_t s_phase = TAG_IDLE;
 
 /* ====================== Tag 主动 POLL ====================== */
 static uint8_t s_tag_proactive_enabled = 1;
-static uint32_t s_tag_poll_interval_ms = 400;
+static uint32_t s_tag_poll_interval_ms = 500;
 static uint32_t s_tag_last_poll_ms = 0;
 static uint8_t s_tag_seq = 0;
 
@@ -446,6 +441,7 @@ static void tag_proactive_try_send_poll(void) {
         }
     }
 }
+
 
 /* TX 完成：区分是 POLL 还是 FINAL */
 

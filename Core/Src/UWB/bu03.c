@@ -34,20 +34,16 @@ int bu03_init(void) {
     GPIO_PinState pin = HAL_GPIO_ReadPin(BOOT1_GPIO_Port, BOOT1_Pin);
     s_role = (pin == GPIO_PIN_RESET) ? BU03_ROLE_ANCHOR : BU03_ROLE_TAG;
 
-    /* 通用 UWB 初始化 */
     const int rc = UWB_DW3000_Init();
     if (rc != 0) {
-        s_last_err = rc;  /* 记录底层返回的具体错误码 */
-        return rc;        /* 直接把错误码返回给上层 */
+        s_last_err = rc;
+        return rc;
     }
 
-    /* 按角色初始化 */
     if (s_role == BU03_ROLE_ANCHOR) {
-        /* 先随机化短地址，确保可能的首次发送前已生效 */
         // anchor_randomize_short();
         anchor_init();
     } else {
-        /* 先随机化短地址，确保可能的首次发送前已生效 */
         // tag_randomize_short();
         tag_init();
     }
