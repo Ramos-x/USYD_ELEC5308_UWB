@@ -8,6 +8,7 @@
 #define UWB_MSG_POLL   0x01
 #define UWB_MSG_RESP   0x02
 #define UWB_MSG_FINAL  0x03
+#define UWB_MSG_FACK   0x04   /* ★ 新增：Final-ACK */
 
 /* ---------- 802.15.4 帧控制字（FCF） ----------
  * Data Frame + PAN Compression + Dest16 + Src16
@@ -53,6 +54,12 @@ typedef struct PACKED {
     uint8_t t_tx3[5]; /* Initiator 发送 FINAL 的时刻 (T5) */
 } pl_final_t;
 
+typedef struct PACKED {
+    uint8_t msg;        /* = UWB_MSG_FACK */
+    uint8_t t_rx3[5];   /* Anchor 接收 FINAL 的时刻（40bit） */
+} pl_fack_t;
+
+
 #if defined(_MSC_VER)
 #pragma pack(pop)
 #endif
@@ -97,6 +104,10 @@ uint16_t uwb_build_final(uint8_t *buf,
                          uint8_t seq, uint16_t pan,
                          uint16_t dest, uint16_t src,
                          uint64_t t_tx1, uint64_t t_rx2, uint64_t t_tx3);
+uint16_t uwb_build_fack(uint8_t *buf,
+                        uint8_t seq, uint16_t pan,
+                        uint16_t dest, uint16_t src,
+                        uint64_t t_rx3);
 
 /* ---------- 解帧 ----------
  * 0 成功；非 0 表示长度不足或 FCF 不匹配

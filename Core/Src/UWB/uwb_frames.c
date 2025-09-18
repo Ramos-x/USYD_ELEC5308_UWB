@@ -3,7 +3,6 @@
 //
 
 #include "uwb_frames.h"
-#include "uwb_frames.h"
 #include <string.h>
 
 /* --- 工具：时间戳 5B <-> 64b --- */
@@ -77,6 +76,22 @@ uint16_t uwb_build_final(uint8_t *buf,
     memcpy(buf + sizeof(hdr), &pl, sizeof(pl));
 
     return (uint16_t) (sizeof(hdr) + sizeof(pl));
+}
+uint16_t uwb_build_fack(uint8_t *buf,
+                        uint8_t seq, uint16_t pan,
+                        uint16_t dest, uint16_t src,
+                        uint64_t t_rx3)
+{
+    mac_hdr_short_t hdr;
+    pl_fack_t pl;
+    pl.msg = UWB_MSG_FACK;
+    uwb_ts64_to_40(t_rx3, pl.t_rx3);
+
+    uwb_mac_hdr_fill(&hdr, seq, pan, dest, src);
+    memcpy(buf, &hdr, sizeof(hdr));
+    memcpy(buf + sizeof(hdr), &pl, sizeof(pl));
+
+    return (uint16_t)(sizeof(hdr) + sizeof(pl));
 }
 
 /* --- 解帧 --- */
