@@ -39,11 +39,10 @@ add_executable(${CMAKE_PROJECT_NAME}
         Core/Src/UWB/deca_spi_port.c
         Core/Src/UWB/bu03.c
         Core/Src/UWB/bu03.h
-        Core/Src/UWB/tag.c
-        Core/Src/UWB/tag.h
-        Core/Src/UWB/anchor.c
-        Core/Src/UWB/anchor.h
-        Core/Src/UWB/tag.c
+#        Core/Src/UWB/tag.c
+#        Core/Src/UWB/tag.h
+#        Core/Src/UWB/anchor.c
+#        Core/Src/UWB/anchor.h
         Core/Src/OLED/oled.c
         Core/Src/UWB/calibration.c
         Core/Src/UWB/discovery.c

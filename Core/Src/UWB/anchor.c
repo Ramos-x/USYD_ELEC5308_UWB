@@ -20,8 +20,9 @@
 #define ANCHOR_ID_LAST          0x0005
 #define ANCHOR_SLOT_COUNT       (ANCHOR_ID_LAST - ANCHOR_ID_FIRST + 1) /* =5 */
 
-#define ANCHOR_SLOT_BASE_US     2500U   /* 槽0 RESP 相对 POLL 的基准延迟（与 Tag 对齐） */
-#define ANCHOR_SLOT_SPACING_US  2000U   /* 槽间隔（与 Tag 对齐） */
+#define ANCHOR_REPLY_BASE_US    2500U   // 槽0 相对 POLL 的基准延迟
+#define ANCHOR_SLOT_SPACING_US  2000U   // 槽间隔
+
 
 /* Tag 会在收到 RESP ~2ms 后发 FINAL，Anchor 侧监听窗口要覆盖它 */
 #define TAG_FINAL_DELAY_US      2000U   /* 与 Tag 侧保持一致 */
@@ -34,7 +35,13 @@
 #define FINAL_WINDOW_US         4000U
 #endif
 
-
+/* ===== UART1 TX 环形缓冲 + DMA 状态 ===== */
+#define UART1_TX_BUF_SZ  2048  // 可按需要调整为 512/1024/4096 等
+static uint8_t uart1_tx_buf[UART1_TX_BUF_SZ];
+static volatile uint16_t tx_head = 0; // 写指针
+static volatile uint16_t tx_tail = 0; // 读指针(下次DMA从这里取)
+static volatile uint16_t dma_chunk_len = 0; // 本次DMA发送的长度
+static volatile uint8_t dma_busy = 0; // 1=DMA正在发送
 /* ================== 时基常量 ================== */
 #ifndef DWT_TIME_UNITS
 #define DWT_TIME_UNITS (1.0/(499.2e6*128.0))
@@ -65,25 +72,14 @@
 #endif
 
 // #define TS_MASK_40 0xFFFFFFFFFFULL
-#define ANCHOR_REPLY_BASE_US     2500U      // 基准(首个Anchor)的延迟（实际使用）
-#define ANCHOR_SLOT_SPACING_US   2000U      // 邻近两个Anchor之间的时隙间隔（实际使用）
-#define NUM_ANCHOR_SLOTS         4          // 先给够，后面想扩到更多Anchor也行
 static volatile uint8_t s_sending_resp = 0;
 static volatile uint16_t s_resp_tag_pending = 0;
 
 extern UART_HandleTypeDef huart1;
-/* Anchor 回复 POLL 的固定延迟（你原有配置） */
-#define ANCHOR_REPLY_DELAY_US 3000U
-#define REPLY_DELAY_DTU       US_TO_DTU(ANCHOR_REPLY_DELAY_US)
-
-/* Anchor 在回 RESP 之后等待 Tag 的 FINAL 的窗口（按 Tag 的 TAG_FINAL_DELAY_US 留裕量） */
-#ifndef FINAL_WINDOW_US
-#define FINAL_WINDOW_US 4000U   /* 可按实测调大/调小 */
-#endif
 
 /* ================== 网络参数 ================== */
 static uint16_t g_pan_id = 0xABCD;
-static uint16_t g_addr_short = 0x0002;
+static uint16_t g_addr_short = 0x0001;
 static const uint16_t g_broadcast_short = 0xFFFF;
 
 /* 节流：避免过快重复发 RESP（可保留） */
@@ -129,20 +125,25 @@ static void sess_clear(uint16_t tag) {
         }
 }
 
-/* 0x0001 -> slot 0, 0x0002 -> slot 1, ... 0x0005 -> slot 4
-   超出范围的ID也能稳定落到 0..(ANCHOR_SLOT_COUNT-1) */
-static inline uint8_t anchor_slot_index_from_id(uint16_t aid)
-{
-    if (aid < ANCHOR_ID_FIRST || aid > ANCHOR_ID_LAST)
-        return (uint8_t)((aid - ANCHOR_ID_FIRST) % ANCHOR_SLOT_COUNT);
-    return (uint8_t)(aid - ANCHOR_ID_FIRST);
+// 槽索引（支持越界ID也稳定落槽）
+static inline uint8_t anchor_slot_index_from_id(uint16_t aid) {
+    int32_t delta = (int32_t) aid - (int32_t) ANCHOR_ID_FIRST;
+    int32_t span = (int32_t) ANCHOR_SLOT_COUNT;
+    int32_t m = delta % span;
+    if (m < 0) m += span; // 显式正模
+    return (uint8_t) m;
 }
 
-static inline uint8_t anchor_slot_index(void)
-{
+static inline uint8_t anchor_slot_index(void) {
     return anchor_slot_index_from_id(g_addr_short);
 }
 
+// 计划 RESP 的延迟：基准 + 槽号×间隔（相对 T_rx1）
+static inline uint64_t plan_tx2_from_rx1(uint64_t t_rx1) {
+    uint8_t slot = anchor_slot_index();
+    uint32_t off_us = ANCHOR_REPLY_BASE_US + (uint32_t) slot * ANCHOR_SLOT_SPACING_US;
+    return (t_rx1 + US_TO_DTU(off_us)) & TS_MASK_40;
+}
 
 /* ========== 地址工具 ========== */
 /* 基于芯片唯一ID生成16位短地址，保证不同设备不会重复 */
@@ -167,9 +168,6 @@ static inline int32_t rel_us(uint64_t newer, uint64_t older) {
     return DTU_TO_US_I32(d); // <= 17,200,000 以内，int32 安全
 }
 
-/* ========== 回调 ========== */
-static volatile uint8_t s_tx_busy = 0;
-
 /* TX 完成：回 RX */
 static void on_tx_done(const dwt_cb_data_t *cb) {
     (void) cb;
@@ -186,6 +184,8 @@ static void on_tx_done(const dwt_cb_data_t *cb) {
 
             char real_hex[11];
             ts40_to_hex(real_hex, real_tx2);
+
+
             uart1_printf("[RESP] tag=%u real_tx2=0x%s plan_off=%ldus real_off=%ldus",
                          (unsigned) s_resp_tag_pending, real_hex,
                          (long) plan_off_us, (long) real_off_us);
@@ -194,28 +194,31 @@ static void on_tx_done(const dwt_cb_data_t *cb) {
         }
         s_sending_resp = 0;
     }
-
-    s_tx_busy = 0;
 }
 
+static void gc_sessions(void) {
+    uint32_t now = HAL_GetTick();
+    for (int i = 0; i < SESS_CAP; ++i) {
+        if (s_sess[i].active && (now - s_sess[i].tick) > 100) {
+            s_sess[i].active = 0;
+        }
+    }
+}
 
 /* RX 超时/错误：回 RX */
 static void on_rx_to(const dwt_cb_data_t *cb) {
     (void) cb;
-    s_tx_busy = 0;
-
     // 可选：简单清理所有活跃会话（或按 tick 做精确过期）
-    for (int i = 0; i < SESS_CAP; ++i) {
-        if (s_sess[i].active) s_sess[i].active = 0;
-    }
-
-    (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    // for (int i = 0; i < SESS_CAP; ++i) {
+    //     if (s_sess[i].active) s_sess[i].active = 0;
+    // }
+    gc_sessions();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
 
 static void on_rx_err(const dwt_cb_data_t *cb) {
     (void) cb;
-    s_tx_busy = 0;
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
@@ -244,16 +247,10 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
             (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
             return;
         }
-
-        /* 我方收到 POLL 的时刻 T_rx1 */
         uint8_t rxts5[5];
         dwt_readrxtimestamp(rxts5);
         uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
-
-
-        uint8_t slot = anchor_slot_index();
-        uint64_t delay_dtu = US_TO_DTU(ANCHOR_REPLY_BASE_US + slot * ANCHOR_SLOT_SPACING_US);
-        uint64_t t_tx2 = (t_rx1 + delay_dtu) & TS_MASK_40;
+        uint64_t t_tx2 = plan_tx2_from_rx1(t_rx1);
 
         // uint64_t t_tx2 = (t_rx1 + REPLY_DELAY_DTU) & 0xFFFFFFFFFFULL;
 
@@ -302,10 +299,8 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
                          (unsigned) tag_id, (unsigned) v.hdr->seq, rx1_hex, plan_hex,
                          (long) rel_us(t_tx2, t_rx1));
         }
-
         return;
     }
-
     /* ---------- 处理 FINAL ---------- */
     if (uwb_get_msg_type(&v) == UWB_MSG_FINAL) {
         uint16_t tag_id = v.hdr->src;
@@ -317,8 +312,7 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
 
         /* （可选）校验序号：只在匹配时计算 */
         if (v.hdr->seq != sess->expect_seq) {
-            /* 允许放宽：如果时序宽松也可接受不匹配的 FINAL */
-            // (void)dwt_rxenable(DWT_START_RX_IMMEDIATE); return;
+            // 放宽条件也可继续处理，这里不直接 return
         }
 
         if (v.payload_len < sizeof(pl_final_t)) {
@@ -332,87 +326,33 @@ static void on_rx_ok(const dwt_cb_data_t *cb) {
         uint64_t t_rx2 = uwb_ts40_to_64(pf->t_rx2);
         uint64_t t_tx3 = uwb_ts40_to_64(pf->t_tx3);
 
-/* 我方收到 POLL 的时刻 T_rx1 */
-uint8_t rxts5[5];
-dwt_readrxtimestamp(rxts5);
-uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
+        /* 切记：这里不要把 FINAL 的 RX 时间当成 RX1！
+           如果只是做一致性校验/日志，用 sess->t_rx1/sess->t_tx2 即可。 */
+        char tx1_hex[11], rx2_hex[11], tx3_hex[11];
+        ts40_to_hex(tx1_hex, t_tx1);
+        ts40_to_hex(rx2_hex, t_rx2);
+        ts40_to_hex(tx3_hex, t_tx3);
 
-/* ====== 固定时隙：基准 + 槽号×间隔（与 RESP 计算一致） ====== */
-uint8_t slot = anchor_slot_index();
-uint32_t off_us = ANCHOR_REPLY_BASE_US + (uint32_t)slot * ANCHOR_SLOT_SPACING_US;
-uint64_t t_tx2 = (t_rx1 + US_TO_DTU(off_us)) & TS_MASK_40;
+        uart1_printf("[FINAL] tag=%u seq=%u tx1=0x%s rx2=0x%s tx3=0x%s",
+                     (unsigned) tag_id, (unsigned) v.hdr->seq,
+                     tx1_hex, rx2_hex, tx3_hex);
 
-        /* DS-TWR：对称公式（40bit 回卷） */
-        // uint64_t Tround1 = (t_rx2 - t_tx1) & TS_MASK_40; /* Tag 视角：POLL→RESP */
-        // uint64_t Treply1 = (t_tx2 - t_rx1) & TS_MASK_40; /* Anchor 视角：POLL→RESP */
-        // uint64_t Tround2 = (t_rx3 - t_tx2) & TS_MASK_40; /* Anchor 视角：RESP→FINAL */
-        // uint64_t Treply2 = (t_tx3 - t_rx2) & TS_MASK_40; /* Tag 视角：RESP→FINAL */
-
-        // /* 常用近似：ToF = ((Tround1 - Treply1) + (Tround2 - Treply2))/4 */
-        // double tof_dtu = 0.25 * ((double) ((int64_t) Tround1 - (int64_t) Treply1)
-        //                          + (double) ((int64_t) Tround2 - (int64_t) Treply2));
-        // if (tof_dtu < 0) tof_dtu = 0;
-        // double dist_m = tof_dtu * DWT_TIME_UNITS * SPEED_OF_LIGHT;
-
-        /* 上报/打印 */
-        // char out[128];
-        // snprintf(out, sizeof(out), "{\"role\":\"anchor\",\"tag\":%u,\"acr\":%u,\"dist\":%.2f}",
-        //          (unsigned) tag_id, (unsigned) g_anchor_short, dist_m);
-        // uart1_println(out);
-        // print_anchor_json_uintmm(tag_id, g_anchor_short, (float) dist_m);
+        /* 计划 vs 实际 RESP 延迟核对：一定要基于 sess->t_rx1 */
+        {
+            int32_t plan_us = rel_us(plan_tx2_from_rx1(sess->t_rx1), sess->t_rx1);
+            int32_t real_us = rel_us(sess->t_tx2,                    sess->t_rx1);
+            uart1_printf("[RESP-CHECK] tag=%u plan_off=%ldus real_off=%ldus",
+                         (unsigned) tag_id, (long) plan_us, (long) real_us);
+        }
 
         /* 会话结束 */
         sess_clear(tag_id);
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-        // ---- 差值与 ToF（DTU）----
-        // int64_t d1 = (int64_t) ((Tround1 - Treply1) & TS_MASK_40);
-        // int64_t d2 = (int64_t) ((Tround2 - Treply2) & TS_MASK_40);
-        // int64_t tof_dtu_i64 = (d1 + d2) / 4;
-        // if (tof_dtu_i64 < 0) tof_dtu_i64 = 0;
-
-        // // 32 位展示值（足够）
-        // int32_t d1_ns = DTU_TO_NS_I32(d1);
-        // int32_t d2_ns = DTU_TO_NS_I32(d2);
-        // int32_t tof_ns = DTU_TO_NS_I32(tof_dtu_i64);
-        // int32_t dist_mm = DTU_TO_MM_I32(tof_dtu_i64);
-        //
-        // uart1_printf("[FINAL] tag=%u d1=%ldDTU(%ldns) d2=%ldDTU(%ldns) "
-        //              "ToF=%ldDTU(%ldns) dist=%ld.%03ldm",
-        //              (unsigned) tag_id,
-        //              (long) d1, (long) d1_ns,
-        //              (long) d2, (long) d2_ns,
-                     // (long) tof_dtu_i64, (long) tof_ns,
-                     // (long) (dist_mm / 1000), (long) labs(dist_mm % 1000));
-
-        {
-            char rx1_hex[11], plan_hex[11];
-            ts40_to_hex(rx1_hex, t_rx1);
-            ts40_to_hex(plan_hex, t_tx2);
-            uart1_printf("[POLL] tag=%u seq=%u slot=%u off_us=%lu rx1=0x%s plan_tx2=0x%s",
-                         (unsigned)tag_id, (unsigned)v.hdr->seq,
-                         (unsigned)slot, (unsigned long)off_us,
-                         rx1_hex, plan_hex);
-        }
-
         return;
     }
 
     /* 其它帧型忽略 */
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-}
-
-
-static void uart1_printf(const char *fmt, ...) {
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n <= 0) return;
-    HAL_UART_Transmit(&huart1, (uint8_t *) buf, (uint16_t) n, 100);
-    const char crlf[2] = {'\r', '\n'};
-    HAL_UART_Transmit(&huart1, (uint8_t *) crlf, 2, 100);
 }
 
 /* ========== 速率/初始化/主循环 ========== */
@@ -430,6 +370,8 @@ void anchor_init(void) {
     char buf[16];
     snprintf(buf, sizeof(buf), "ACR:%04X", (unsigned) g_addr_short);
     OLED_ShowString(0, 8, buf);
+    OLED_Update();
+
 
     dwt_setcallbacks(on_tx_done, on_rx_ok, on_rx_to, on_rx_err, NULL, NULL);
     /* ★ 打开 RX 超时中断，否则 FINAL 监听窗到期不会回调 on_rx_to */
@@ -455,4 +397,6 @@ void anchor_process(void) {
     // if (dwt_checkirq()) {
     //     dwt_isr();
     // }
+    gc_sessions();
+
 }
