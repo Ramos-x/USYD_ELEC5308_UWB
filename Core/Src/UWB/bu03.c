@@ -176,11 +176,11 @@ static const uint16_t g_bcast = 0xFFFF;
 /* ======================= TAG 部分 ======================= */
 /* Tag 发送 FINAL 的固定延迟（相对收到 RESP） */
 #define TAG_FINAL_DELAY_US   1000U
-#define FINAL_CHAIN_GAP_US    600U
+#define FINAL_CHAIN_GAP_US    1000U
 #ifndef RESP_WINDOW_US
 #define RESP_WINDOW_US       6000U  //当前 800+4*1000
 #endif
-#define ACK_WINDOW_US   3000U      /* FINAL 后等待 FACK 的窗口 */
+#define ACK_WINDOW_US   6000U      /* FINAL 后等待 FACK 的窗口 */
 #define FINAL_DELAY_DTU  ((uint64_t)((TAG_FINAL_DELAY_US*1e-6)/DWT_TIME_UNITS + 0.5))
 #define FINAL_CHAIN_GAP_DTU US_TO_DTU(FINAL_CHAIN_GAP_US)
 
@@ -366,14 +366,42 @@ static uint32_t s_tag_poll_interval_ms = 500; // 你可以改回 1000ms
 static uint32_t s_tag_last_poll_ms = 0;
 static uint8_t s_tag_seq = 0;
 
+/* ===== 顺序轮询地址 0x0001~0x0005 ===== */
+#define AID_FIRST 0x0001
+#define AID_LAST  0x0005
+static const uint16_t s_poll_targets[] = {0x0001, 0x0002, 0x0003, 0x0004, 0x0005};
+static const uint8_t s_target_count = sizeof(s_poll_targets) / sizeof(s_poll_targets[0]);
+static uint8_t s_target_idx = 0; /* 当前要轮询的目标在上面数组里的索引 */
+static uint16_t s_current_anchor = 0; /* 当前这轮交互的 Anchor 短地址（发 POLL 时确定） */
+
+/* 推进到下一个 Anchor（循环 1→5→1） */
+static inline void advance_to_next_anchor(void) {
+    s_target_idx = (uint8_t) ((s_target_idx + 1) % s_target_count);
+    s_current_anchor = 0;
+    s_wait_ack_anchor = 0;
+    s_phase = TAG_IDLE;
+    s_tx_busy = 0;
+    s_resp_window_over = 0;
+    finalq_reset();
+    dwt_setrxtimeout(0);
+    (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
 /* = Tag 内部函数 = */
 static void schedule_next_final(void); // 前置声明
 
 static void tag_proactive_try_send_poll(void) {
     if (s_tx_busy) return;
+
+    /* 选择当前要打的 Anchor */
+    const uint16_t dest = s_poll_targets[s_target_idx];
+    s_current_anchor = dest;
+
     dwt_forcetrxoff();
     uint8_t tx[32];
-    uint16_t mac_len = uwb_build_poll(tx, s_tag_seq++, g_pan_id, g_bcast, g_tag_short);
+    /* !!! 把原来的 g_bcast 改为 dest !!! */
+    uint16_t mac_len = uwb_build_poll(tx, s_tag_seq++, g_pan_id, dest, g_tag_short);
+
     if (dwt_writetxdata(mac_len, tx, 0) == DWT_SUCCESS) {
         dwt_writetxfctrl(mac_len + 2, 0, 1);
         dwt_setrxaftertxdelay(0);
@@ -387,6 +415,7 @@ static void tag_proactive_try_send_poll(void) {
         }
     }
 }
+
 
 static void tag_on_tx_done(const dwt_cb_data_t *cb) {
     (void) cb;
@@ -453,26 +482,39 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
     /* === FACK === */
     if (type == UWB_MSG_FACK) {
         if (v.payload_len >= sizeof(pl_fack_t)) {
-            const pl_fack_t *ack = (const pl_fack_t *) v.payload;
-            if (s_wait_ack_anchor == 0 || v.hdr->src == s_wait_ack_anchor) {
+            const pl_fack_t *ack = (const pl_fack_t *)v.payload;
+
+            if (s_phase == TAG_FINAL_SCHEDULED &&
+                s_wait_ack_anchor != 0 &&
+                v.hdr->src == s_wait_ack_anchor &&
+                v.hdr->dst == g_tag_short)
+            {
                 uint64_t t_rx3 = uwb_ts40_to_64(ack->t_rx3);
-                char rx3_hex[11];
-                ts40_to_hex(rx3_hex, t_rx3);
-                uart1_printf("[ACK] acr=%u rx3=0x%s", (unsigned) v.hdr->src, rx3_hex);
-                /* ★ 完整交互：拿到 Anchor 在 FACK 中回传的 RX3 */
+                char rx3_hex[11]; ts40_to_hex(rx3_hex, t_rx3);
+                uart1_printf("[ACK] acr=%u rx3=0x%s", (unsigned)v.hdr->src, rx3_hex);
+
                 anchor_info_t *ai2 = find_or_alloc_anchor(v.hdr->src);
                 if (ai2) {
-                    ai2->rx3_ack = uwb_ts40_to_64(ack->t_rx3);
+                    ai2->rx3_ack   = t_rx3;
                     ai2->have_xchg = 1;
-                    ai2->updated = 1;
+                    ai2->updated   = 1;
                 }
 
-                s_wait_ack_anchor = 0; /* 收到就清 */
+                s_wait_ack_anchor = 0;
+                /* 完成本 Anchor，推进 */
+                advance_to_next_anchor();
+                return;
             }
         }
-        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        /* 非期望帧：务必重置等待窗口！ */
+        if (s_phase == TAG_FINAL_SCHEDULED) {
+            dwt_setrxtimeout(ACK_WINDOW_US);                // 重新编程超时
+        }
+        (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
+
+
 
     /* === RESP === */
     if (type != UWB_MSG_RESP) {
@@ -485,6 +527,11 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
     }
 
     uint16_t anchor_id = v.hdr->src;
+    /* 只处理当前目标 Anchor 的 RESP，其它忽略 */
+    if (s_current_anchor == 0 || anchor_id != s_current_anchor) {
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
 
     /* 本端接收该 RESP 的时刻 */
     uint8_t rxts5[5];
@@ -535,43 +582,23 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
 static void tag_on_rx_to(const dwt_cb_data_t *cb) {
     (void) cb;
 
+    // FACK 超时
     if (s_phase == TAG_FINAL_SCHEDULED) {
-        // 等 FACK 超时
+        /* 等 FACK 超时：视为本 Anchor 结束，推进到下一个 */
         s_wait_ack_anchor = 0;
-
-        // 如果还有 FINAL 待发，继续排下一帧
-        if (s_qcount > 0) {
-            schedule_next_final();
-            return;
-        }
-
-        // 没有更多 FINAL 了，看 RESP 窗口是否已结束
-        if (s_resp_window_over) {
-            s_phase = TAG_IDLE;
-            s_tx_busy = 0;
-            dwt_setrxtimeout(0);
-        } else {
-            // 回到等其它 Anchor 的 RESP
-            s_phase = TAG_WAIT_RESP;
-            dwt_setrxtimeout(RESP_WINDOW_US);
-        }
-        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        advance_to_next_anchor();
         return;
     }
 
-    // 旧逻辑：RESP 窗口超时
+
+    // RESP 窗口超时
     s_resp_window_over = 1;
     if (s_phase == TAG_WAIT_RESP) {
-        if (s_qcount > 0) {
-            schedule_next_final();
-        } else {
-            s_phase = TAG_IDLE;
-            s_tx_busy = 0;
-            dwt_setrxtimeout(0);
-            (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        }
+        /* 未收到 RESP：也推进到下一个 Anchor */
+        advance_to_next_anchor();
         return;
     }
+
 
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
@@ -708,11 +735,11 @@ static void try_flush_json(void) {
         n = snprintf(out + pos, sizeof(out) - pos,
                      "%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"tick\":%lu,"
                      "\"dist_mm\":%ld,"
-                     "\"ts\":\"%s\"," /* 兼容旧字段：仍表示 rx2 的 5B */
+                     "\"ts\":\"%s\","  /* 兼容旧字段：仍表示 rx2 的 5B */
                      "\"ex\":{\"seq\":%u,"
                      "\"tx1\":\"%s\",\"rx2\":\"%s\",\"tx3p\":\"%s\",\"tx3r\":\"%s\",\"rx3\":\"%s\","
                      "\"complete\":%u},"
-                     "\"dt_us\":{\"tx1_rx2\":%ld,\"rx2_tx3p\":%ld,\"rx2_tx3r\":%ld,\"tx3r_rx3\":%ld}"
+                     "\"dt_us\":{\"tx1_rx2\":%ld,\"rx2_tx3p\":%ld,\"rx2_tx3r\":%ld}"
                      "}",
                      first ? "" : ",",
                      (unsigned) g_anchors[i].id, (unsigned) g_anchors[i].id,
@@ -722,7 +749,8 @@ static void try_flush_json(void) {
                      (unsigned) g_anchors[i].seq_final,
                      h_tx1, h_rx2, h_tx3p, h_tx3r, h_rx3,
                      (unsigned) g_anchors[i].have_xchg,
-                     (long) dt_tx1_rx2, (long) dt_rx2_tx3p, (long) dt_rx2_tx3r, (long) dt_tx3r_rx3);
+                     (long) dt_tx1_rx2, (long) dt_rx2_tx3p, (long) dt_rx2_tx3r);
+
 
         if (n <= 0) break;
         if ((size_t) n >= (sizeof(out) - pos - 2)) break;
@@ -946,6 +974,12 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
 
     /* --- POLL --- */
     if (uwb_get_msg_type(&v) == UWB_MSG_POLL) {
+        /* 只响应发给我的 unicast 或广播 */
+        if (!(v.hdr->dst == g_addr_short || v.hdr->dst == g_bcast)) {
+            (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            return;
+        }
+
         uint32_t now_ms = HAL_GetTick();
         if ((now_ms - g_last_tx_ms_acr) < g_min_interval_ms_acr) {
             (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
@@ -999,6 +1033,11 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
 
     /* --- FINAL --- */
     if (uwb_get_msg_type(&v) == UWB_MSG_FINAL) {
+        /* 只处理发给我的 FINAL（Tag->Anchor 的 dest 应该是我） */
+        if (v.hdr->dst != g_addr_short) {
+            (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            return;
+        }
         uint16_t tag_id = v.hdr->src;
         ds_sess_t *sess = sess_find(tag_id);
         if (!sess || !sess->active) {

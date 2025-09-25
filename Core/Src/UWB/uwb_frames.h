@@ -32,7 +32,7 @@ typedef struct PACKED {
     uint16_t fcf; /* = MAC_FCF_DATA_PANCOMP_SHORT (小端常量) */
     uint8_t seq; /* 序号 */
     uint16_t pan; /* PAN ID */
-    uint16_t dest; /* 目的短地址 */
+    uint16_t dst; /* 目的短地址 */
     uint16_t src; /* 源短地址 */
 } mac_hdr_short_t;
 

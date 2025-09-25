@@ -23,7 +23,7 @@ void uwb_mac_hdr_fill(mac_hdr_short_t *h,
     h->fcf = MAC_FCF_DATA_PANCOMP_SHORT; /* 小端常量 */
     h->seq = seq;
     h->pan = pan;
-    h->dest = dest;
+    h->dst = dest;
     h->src = src;
 }
 
