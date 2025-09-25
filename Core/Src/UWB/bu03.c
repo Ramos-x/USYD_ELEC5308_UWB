@@ -277,11 +277,22 @@ static void log_flush(void) {
 /* Tag 侧：Anchor 信息聚合（仅日志/上报用） */
 typedef struct {
     uint16_t id;
-    uint8_t ts[5];
+    uint8_t ts[5]; /* 兼容老字段：最近 RX2（保留不删） */
     float dist_m;
     uint32_t last_tick;
-    uint8_t updated;
+    uint8_t updated; /* 有新数据待上报 */
+
+    /* ★ 新增：一次交互的关键时间戳 */
+    uint8_t have_xchg; /* 1=本轮交互已完整（至少拿到 FACK） */
+    uint8_t seq_final; /* FINAL 的 seq（= RESP.seq+1） */
+
+    uint64_t tx1; /* Tag 发送 POLL(TX1) */
+    uint64_t rx2; /* Tag 接收 RESP(RX2) */
+    uint64_t tx3_plan; /* Tag 计划 FINAL(TX3 plan) */
+    uint64_t tx3_real; /* Tag 实际 FINAL(TX3 real) */
+    uint64_t rx3_ack; /* Anchor 在 FACK 中回传的 RX3（Anchor 收到 FINAL 的时刻） */
 } anchor_info_t;
+
 
 #define MAX_ANCHORS 16
 static anchor_info_t g_anchors[MAX_ANCHORS];
@@ -388,6 +399,16 @@ static void tag_on_tx_done(const dwt_cb_data_t *cb) {
     }
     if (s_phase == TAG_FINAL_SCHEDULED) {
         uint64_t tx3_real = uwb_ts40_to_64(txts5);
+
+        /* ★ 记录实际 TX3（用当前等待 FACK 的 anchor id） */
+        if (s_wait_ack_anchor) {
+            anchor_info_t *ai = find_or_alloc_anchor(s_wait_ack_anchor);
+            if (ai) {
+                ai->tx3_real = tx3_real;
+                ai->updated = 1;
+            }
+        }
+
         (void) tx3_real; // 可日志
         finalq_pop();
         if (s_qcount > 0) {
@@ -435,8 +456,17 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
             const pl_fack_t *ack = (const pl_fack_t *) v.payload;
             if (s_wait_ack_anchor == 0 || v.hdr->src == s_wait_ack_anchor) {
                 uint64_t t_rx3 = uwb_ts40_to_64(ack->t_rx3);
-                char rx3_hex[11]; ts40_to_hex(rx3_hex, t_rx3);
-                uart1_printf("[ACK] acr=%u rx3=0x%s", (unsigned)v.hdr->src, rx3_hex);
+                char rx3_hex[11];
+                ts40_to_hex(rx3_hex, t_rx3);
+                uart1_printf("[ACK] acr=%u rx3=0x%s", (unsigned) v.hdr->src, rx3_hex);
+                /* ★ 完整交互：拿到 Anchor 在 FACK 中回传的 RX3 */
+                anchor_info_t *ai2 = find_or_alloc_anchor(v.hdr->src);
+                if (ai2) {
+                    ai2->rx3_ack = uwb_ts40_to_64(ack->t_rx3);
+                    ai2->have_xchg = 1;
+                    ai2->updated = 1;
+                }
+
                 s_wait_ack_anchor = 0; /* 收到就清 */
             }
         }
@@ -462,23 +492,35 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
     uint64_t t_rx2 = uwb_ts40_to_64(rxts5);
 
     /* 入队 FINAL（去重）: FINAL 序号 = RESP.seq + 1 */
-    (void) finalq_push_if_absent(v.hdr->pan, anchor_id, (uint8_t)(v.hdr->seq + 1),
+    (void) finalq_push_if_absent(v.hdr->pan, anchor_id, (uint8_t) (v.hdr->seq + 1),
                                  g_last_poll_tx_ts, t_rx2);
 
-    /* 维护上报用 anchor 列表 */
+    /* ★ 记录本轮交互（以 Anchor 为单位） */
     anchor_info_t *ai = find_or_alloc_anchor(anchor_id);
     if (ai) {
         ai->id = anchor_id;
+        /* 原有：保存 ts[5] 为 rx2 的 5B 形式，用于兼容老 JSON */
         uint8_t ts5[5] = {
-            (uint8_t)(t_rx2 & 0xFF), (uint8_t)((t_rx2 >> 8) & 0xFF),
-            (uint8_t)((t_rx2 >> 16) & 0xFF), (uint8_t)((t_rx2 >> 24) & 0xFF),
-            (uint8_t)((t_rx2 >> 32) & 0xFF)
+            (uint8_t) (t_rx2 & 0xFF), (uint8_t) ((t_rx2 >> 8) & 0xFF),
+            (uint8_t) ((t_rx2 >> 16) & 0xFF), (uint8_t) ((t_rx2 >> 24) & 0xFF),
+            (uint8_t) ((t_rx2 >> 32) & 0xFF)
         };
         memcpy(ai->ts, ts5, 5);
+
         ai->last_tick = HAL_GetTick();
         ai->dist_m = 0;
-        ai->updated = 1;
+
+        /* ★ 新增：交互时间戳 */
+        ai->seq_final = (uint8_t) (v.hdr->seq + 1);
+        ai->tx1 = g_last_poll_tx_ts;
+        ai->rx2 = t_rx2;
+        ai->tx3_plan = 0;
+        ai->tx3_real = 0;
+        ai->rx3_ack = 0;
+        ai->have_xchg = 0; /* 还没拿到 FACK */
+        ai->updated = 1; /* 本条会被 JSON 带出去 */
     }
+
 
     /* 从 0→1 时立刻排第一帧 FINAL */
     if (s_phase == TAG_WAIT_RESP && s_qcount == 1) {
@@ -491,7 +533,7 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
 
 
 static void tag_on_rx_to(const dwt_cb_data_t *cb) {
-    (void)cb;
+    (void) cb;
 
     if (s_phase == TAG_FINAL_SCHEDULED) {
         // 等 FACK 超时
@@ -513,7 +555,7 @@ static void tag_on_rx_to(const dwt_cb_data_t *cb) {
             s_phase = TAG_WAIT_RESP;
             dwt_setrxtimeout(RESP_WINDOW_US);
         }
-        (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
 
@@ -526,12 +568,12 @@ static void tag_on_rx_to(const dwt_cb_data_t *cb) {
             s_phase = TAG_IDLE;
             s_tx_busy = 0;
             dwt_setrxtimeout(0);
-            (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         }
         return;
     }
 
-    (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
 
@@ -550,6 +592,14 @@ static void schedule_next_final(void) {
         uint64_t min_next = (s_last_planned_ttx3 + FINAL_CHAIN_GAP_DTU) & TS_MASK_40;
         t_tx3 = max40(t_tx3, min_next);
     }
+
+    /* ★ 记录计划的 TX3 */
+    anchor_info_t *ai = find_or_alloc_anchor(job->anchor_id);
+    if (ai) {
+        ai->tx3_plan = t_tx3;
+        ai->updated = 1;
+    }
+
     uint8_t ftx[64];
     uint16_t flen = uwb_build_final(ftx, job->seq, job->pan,
                                     job->anchor_id, g_tag_short,
@@ -611,7 +661,7 @@ static void try_flush_json(void) {
     char out[1536];
     size_t pos = 0;
     int n = snprintf(out + pos, sizeof(out) - pos,
-                     "{\"role\":\"tag\",\"tag\":%u,\"tick\":%lu,\"anchor_count\":%d,\"anchors\":[",
+                     "{\"role\":\"tag\",\"tag\":\"0x%04X\",\"tick\":%lu,\"anchor_count\":%d,\"anchors\":[",
                      (unsigned) g_tag_short, (unsigned long) now, total);
     if (n <= 0) { return; }
     pos += (size_t) n;
@@ -619,23 +669,67 @@ static void try_flush_json(void) {
     int first = 1;
     for (int i = 0; i < MAX_ANCHORS; ++i) {
         if (!g_anchors[i].id) continue;
+
+        /* 旧字段：ts_hex（沿用为 rx2 的 5B 表达） */
         char ts_hex[11];
         for (int k = 0; k < 5; ++k) {
             ts_hex[k * 2] = hex4(g_anchors[i].ts[k] >> 4);
             ts_hex[k * 2 + 1] = hex4(g_anchors[i].ts[k]);
         }
         ts_hex[10] = '\0';
+
         long dist_mm = (long) (g_anchors[i].dist_m * 1000.0f + 0.5f);
+
+        /* ★ 新增：把 64b 时间戳转为 5B 十六进制字符串（高位在前） */
+        char h_tx1[11] = "0000000000";
+        char h_rx2[11] = "0000000000";
+        char h_tx3p[11] = "0000000000";
+        char h_tx3r[11] = "0000000000";
+        char h_rx3[11] = "0000000000";
+        if (g_anchors[i].tx1) ts40_to_hex(h_tx1, g_anchors[i].tx1);
+        if (g_anchors[i].rx2) ts40_to_hex(h_rx2, g_anchors[i].rx2);
+        if (g_anchors[i].tx3_plan) ts40_to_hex(h_tx3p, g_anchors[i].tx3_plan);
+        if (g_anchors[i].tx3_real) ts40_to_hex(h_tx3r, g_anchors[i].tx3_real);
+        if (g_anchors[i].rx3_ack) ts40_to_hex(h_rx3, g_anchors[i].rx3_ack);
+
+        /* ★ 新增：相对时延(us) */
+        int32_t dt_tx1_rx2 = (g_anchors[i].tx1 && g_anchors[i].rx2) ? rel_us(g_anchors[i].rx2, g_anchors[i].tx1) : 0;
+        int32_t dt_rx2_tx3p = (g_anchors[i].rx2 && g_anchors[i].tx3_plan)
+                                  ? rel_us(g_anchors[i].tx3_plan, g_anchors[i].rx2)
+                                  : 0;
+        int32_t dt_rx2_tx3r = (g_anchors[i].rx2 && g_anchors[i].tx3_real)
+                                  ? rel_us(g_anchors[i].tx3_real, g_anchors[i].rx2)
+                                  : 0;
+        int32_t dt_tx3r_rx3 = (g_anchors[i].tx3_real && g_anchors[i].rx3_ack)
+                                  ? rel_us(g_anchors[i].rx3_ack, g_anchors[i].tx3_real)
+                                  : 0;
+
+        /* ★ 输出 JSON：在每个 anchor 下新增 ex{} 与 dt_us{} */
         n = snprintf(out + pos, sizeof(out) - pos,
-                     "%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"ts\":\"%s\",\"tick\":%lu,\"dist_mm\":%ld}",
+                     "%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"tick\":%lu,"
+                     "\"dist_mm\":%ld,"
+                     "\"ts\":\"%s\"," /* 兼容旧字段：仍表示 rx2 的 5B */
+                     "\"ex\":{\"seq\":%u,"
+                     "\"tx1\":\"%s\",\"rx2\":\"%s\",\"tx3p\":\"%s\",\"tx3r\":\"%s\",\"rx3\":\"%s\","
+                     "\"complete\":%u},"
+                     "\"dt_us\":{\"tx1_rx2\":%ld,\"rx2_tx3p\":%ld,\"rx2_tx3r\":%ld,\"tx3r_rx3\":%ld}"
+                     "}",
                      first ? "" : ",",
                      (unsigned) g_anchors[i].id, (unsigned) g_anchors[i].id,
-                     ts_hex, (unsigned long) g_anchors[i].last_tick, dist_mm);
+                     (unsigned long) g_anchors[i].last_tick,
+                     dist_mm,
+                     ts_hex,
+                     (unsigned) g_anchors[i].seq_final,
+                     h_tx1, h_rx2, h_tx3p, h_tx3r, h_rx3,
+                     (unsigned) g_anchors[i].have_xchg,
+                     (long) dt_tx1_rx2, (long) dt_rx2_tx3p, (long) dt_rx2_tx3r, (long) dt_tx3r_rx3);
+
         if (n <= 0) break;
         if ((size_t) n >= (sizeof(out) - pos - 2)) break;
         pos += (size_t) n;
         first = 0;
     }
+
     if (pos < sizeof(out)) out[pos++] = ']';
     if (pos < sizeof(out)) out[pos++] = '}';
     out[(pos < sizeof(out)) ? pos : (sizeof(out) - 1)] = '\0';
@@ -800,7 +894,7 @@ static void gc_sessions(void) {
 }
 
 static void anchor_on_tx_done(const dwt_cb_data_t *cb) {
-    (void)cb;
+    (void) cb;
     if (s_sending_resp) {
         uint8_t txts5[5];
         dwt_readtxtimestamp(txts5);
@@ -809,9 +903,10 @@ static void anchor_on_tx_done(const dwt_cb_data_t *cb) {
         if (sess && sess->active) {
             int32_t plan_off_us = rel_us(sess->t_tx2, sess->t_rx1);
             int32_t real_off_us = rel_us(real_tx2, sess->t_rx1);
-            char real_hex[11]; ts40_to_hex(real_hex, real_tx2);
+            char real_hex[11];
+            ts40_to_hex(real_hex, real_tx2);
             uart1_printf("[RESP] tag=%u real_tx2=0x%s plan_off=%ldus real_off=%ldus",
-                         (unsigned)s_resp_tag_pending, real_hex, (long)plan_off_us, (long)real_off_us);
+                         (unsigned) s_resp_tag_pending, real_hex, (long) plan_off_us, (long) real_off_us);
             sess->t_tx2 = real_tx2;
         }
         s_sending_resp = 0;
@@ -954,15 +1049,15 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
                                           /* t_rx3 */ t_rx3);
         // 发送 FACK 之前：
         dwt_setrxaftertxdelay(0);
-        dwt_setrxtimeout(0);   // 0 表示无限等待
+        dwt_setrxtimeout(0); // 0 表示无限等待
 
         // 组并发 FACK 之前
-        uart1_printf("[FACK-SCHED] tag=%u t_tx4=+%ldus", (unsigned)tag_id, (long)ACR_ACK_DELAY_US);
+        uart1_printf("[FACK-SCHED] tag=%u t_tx4=+%ldus", (unsigned) tag_id, (long) ACR_ACK_DELAY_US);
 
         // 延迟发送（会在 TX 后自动回 RX）
         if (dwt_writetxdata(ack_len, ack, 0) == DWT_SUCCESS) {
             dwt_writetxfctrl(ack_len + 2, 0, 1);
-            dwt_setdelayedtrxtime((uint32_t)(t_tx4 >> 8));
+            dwt_setdelayedtrxtime((uint32_t) (t_tx4 >> 8));
             int st = dwt_starttx(DWT_START_TX_DELAYED);
             uart1_printf("[FACK-TX] start=%d len=%u", st, ack_len);
             if (st != DWT_SUCCESS) {
