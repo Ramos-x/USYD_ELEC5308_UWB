@@ -14,7 +14,7 @@ void app_init(I2C_HandleTypeDef* i2c_for_oled);
 void app_process(void);
 
 /* 底层上报：标签到各锚点的距离（单位：米）。anchor_ids 与 distances_m 一一对应，count 为条目数。 */
-void app_on_tag_ranges(uint32_t count, const uint32_t* anchor_ids, const float* distances_m);
+void app_on_tag_ranges(uint32_t count, const uint32_t* anchor_ids);
 
 #ifdef __cplusplus
 }

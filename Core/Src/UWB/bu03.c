@@ -288,7 +288,7 @@ static void log_flush(void) {
 typedef struct {
     uint16_t id;
     uint8_t ts[5]; /* 兼容老字段：最近 RX2（保留不删） */
-    float dist_m;
+    // float dist_m;
     uint32_t last_tick;
     uint8_t updated; /* 有新数据待上报 */
 
@@ -298,6 +298,8 @@ typedef struct {
 
     uint64_t tx1; /* Tag 发送 POLL(TX1) */
     uint64_t rx2; /* Tag 接收 RESP(RX2) */
+    uint64_t rx1_resp; /* Anchor 在 RESP 中回传的 RX1（Anchor 收到 POLL 的时刻） */
+    uint64_t tx2_resp; /* Anchor 在 RESP 中回传的 TX2（Anchor 发送 RESP 的时刻） */
     uint64_t tx3_plan; /* Tag 计划 FINAL(TX3 plan) */
     uint64_t tx3_real; /* Tag 实际 FINAL(TX3 real) */
     uint64_t rx3_ack; /* Anchor 在 FACK 中回传的 RX3（Anchor 收到 FINAL 的时刻） */
@@ -525,6 +527,10 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
+    /* 从 RESP 负载提取 Anchor 的 rx1/tx2 */
+    const pl_resp_t *pr = (const pl_resp_t *) v.payload;
+    uint64_t t_rx1_an = uwb_ts40_to_64(pr->t_rx1);
+    uint64_t t_tx2_an = uwb_ts40_to_64(pr->t_tx2);
 
     uint16_t anchor_id = v.hdr->src;
     /* 只处理当前目标 Anchor 的 RESP，其它忽略 */
@@ -556,12 +562,14 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
         memcpy(ai->ts, ts5, 5);
 
         ai->last_tick = HAL_GetTick();
-        ai->dist_m = 0;
+        // ai->dist_m = 0;
 
         /* ★ 新增：交互时间戳 */
         ai->seq_final = (uint8_t) (v.hdr->seq + 1);
         ai->tx1 = g_last_poll_tx_ts;
         ai->rx2 = t_rx2;
+        ai->rx1_resp = t_rx1_an;
+        ai->tx2_resp = t_tx2_an;
         ai->tx3_plan = 0;
         ai->tx3_real = 0;
         ai->rx3_ack = 0;
@@ -677,7 +685,7 @@ static void try_flush_json(void) {
         return;
     }
 
-    char out[1536];
+    char out[2048];
     size_t pos = 0;
     int n = snprintf(out + pos, sizeof(out) - pos,
                      "{\"role\":\"tag\",\"tag\":\"0x%04X\",\"tick\":%lu,\"anchor_count\":%d,\"anchors\":[",
@@ -697,15 +705,19 @@ static void try_flush_json(void) {
         }
         ts_hex[10] = '\0';
 
-        long dist_mm = (long) (g_anchors[i].dist_m * 1000.0f + 0.5f);
+        // long dist_mm = (long) (g_anchors[i].dist_m * 1000.0f + 0.5f);
 
         /* ★ 新增：把 64b 时间戳转为 5B 十六进制字符串（高位在前） */
         char h_tx1[11] = "0000000000";
+        char h_rx1[11] = "0000000000";
+        char h_tx2[11] = "0000000000";
         char h_rx2[11] = "0000000000";
         char h_tx3p[11] = "0000000000";
         char h_tx3r[11] = "0000000000";
         char h_rx3[11] = "0000000000";
         if (g_anchors[i].tx1) ts40_to_hex(h_tx1, g_anchors[i].tx1);
+        if (g_anchors[i].rx1_resp) ts40_to_hex(h_rx1, g_anchors[i].rx1_resp);
+        if (g_anchors[i].tx2_resp) ts40_to_hex(h_tx2, g_anchors[i].tx2_resp);
         if (g_anchors[i].rx2) ts40_to_hex(h_rx2, g_anchors[i].rx2);
         if (g_anchors[i].tx3_plan) ts40_to_hex(h_tx3p, g_anchors[i].tx3_plan);
         if (g_anchors[i].tx3_real) ts40_to_hex(h_tx3r, g_anchors[i].tx3_real);
@@ -725,21 +737,21 @@ static void try_flush_json(void) {
 
         /* ★ 输出 JSON：在每个 anchor 下新增 ex{} 与 dt_us{} */
         n = snprintf(out + pos, sizeof(out) - pos,
-                     "\n%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"tick\":%lu,"
-                     "\"dist_mm\":%ld,"
+                     "%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"tick\":%lu,"
+                     // "\"dist_mm\":%ld,"
                      "\"ts\":\"%s\","  /* 兼容旧字段：仍表示 rx2 的 5B */
                      "\"ex\":{\"seq\":%u,"
-                     "\"tx1\":\"%s\",\"rx2\":\"%s\",\"tx3p\":\"%s\",\"tx3r\":\"%s\",\"rx3\":\"%s\","
+                     "\"tx1\":\"%s\",\"rx1\":\"%s\",\"tx2\":\"%s\",\"rx2\":\"%s\",\"tx3p\":\"%s\",\"tx3r\":\"%s\",\"rx3\":\"%s\","
                      "\"complete\":%u},"
                      "\"dt_us\":{\"tx1_rx2\":%ld,\"rx2_tx3p\":%ld,\"rx2_tx3r\":%ld}"
                      "}",
-                     first ? "" : ",",
+                     first ? "\n" : ",\n",
                      (unsigned) g_anchors[i].id, (unsigned) g_anchors[i].id,
                      (unsigned long) g_anchors[i].last_tick,
-                     dist_mm,
+                     // dist_mm,
                      ts_hex,
                      (unsigned) g_anchors[i].seq_final,
-                     h_tx1, h_rx2, h_tx3p, h_tx3r, h_rx3,
+                     h_tx1, h_rx1, h_tx2, h_rx2, h_tx3p, h_tx3r, h_rx3,
                      (unsigned) g_anchors[i].have_xchg,
                      (long) dt_tx1_rx2, (long) dt_rx2_tx3p, (long) dt_rx2_tx3r);
 
@@ -760,23 +772,24 @@ static void try_flush_json(void) {
 
     /* 通知应用层：只上报本次有更新的 anchor */
     uint32_t ids[16];
-    float dists[16];
+    // float dists[16];
     uint32_t cnt = 0;
     for (int i = 0; i < MAX_ANCHORS && cnt < 16; ++i) {
         if (!g_anchors[i].id || !g_anchors[i].updated) continue;
         ids[cnt] = g_anchors[i].id;
-        dists[cnt] = g_anchors[i].dist_m;
+        // dists[cnt] = g_anchors[i].dist_m;
         g_anchors[i].updated = 0;
         cnt++;
     }
-    if (cnt > 0) app_on_tag_ranges(cnt, ids, dists);
+    if (cnt > 0) app_on_tag_ranges(cnt, ids);
     g_last_flush_ms_tag = now;
 }
 
 void tag_set_rate_hz(float rate) {
-    if (rate < 0.1f) rate = 0.1f;
-    if (rate > 100.0f) rate = 100.0f;
-    g_min_interval_ms_tag = (uint32_t) (1000.0f / rate + 0.5f);
+    // if (rate < 0.1f) rate = 0.1f;
+    // if (rate > 100.0f) rate = 100.0f;
+    // g_min_interval_ms_tag = (uint32_t) (1000.0f / rate + 0.5f);
+    g_min_interval_ms_tag = (uint32_t) (1000.0f / rate);
 }
 
 void tag_init(void) {
@@ -809,7 +822,7 @@ void tag_init(void) {
         anchor_info_t *ai = find_or_alloc_anchor(aid);
         if (ai) {
             ai->last_tick = 0;
-            ai->dist_m = 0;
+            // ai->dist_m = 0;
             ai->updated = 0;
             memset(ai->ts, 0, 5);
         }
@@ -834,11 +847,11 @@ void tag_process(void) {
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 /* Anchor 侧短地址与速率节流 */
-static uint16_t g_addr_short = 0x0002;
+static uint16_t g_addr_short = 0x0001;
 uint16_t anchor_get_short(void) { return g_addr_short; }
 void anchor_randomize_short(void) { g_addr_short = 0x0001; } // 可改为UID映射
 
-static volatile uint32_t g_min_interval_ms_acr = 1; // RESP 节流（可调）
+static volatile uint32_t g_min_interval_ms_acr = 1;
 static volatile uint32_t g_last_tx_ms_acr = 0;
 
 /* Anchor 会话记录（每 Tag） */
@@ -1120,9 +1133,10 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
 
 /* Anchor API */
 void anchor_set_rate_hz(float rate) {
-    if (rate < 0.1f) rate = 0.1f;
-    if (rate > 100.0f) rate = 100.0f;
-    g_min_interval_ms_acr = (uint32_t) (1000.0f / rate + 0.5f);
+    // if (rate < 0.1f) rate = 0.1f;
+    // if (rate > 100.0f) rate = 100.0f;
+    // g_min_interval_ms_acr = (uint32_t) (1000.0f / rate + 0.5f);
+    g_min_interval_ms_acr=(uint32_t) (1000.0f / rate);
 }
 
 void anchor_init(void) {
@@ -1157,7 +1171,7 @@ void anchor_process(void) {
 /* ======================= 角色封装（与示例一致） ======================= */
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 10.0f
+#define BU03_RATE_HZ_DEFAULT 20.0f
 #endif
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int s_init_ok = 0;
@@ -1206,9 +1220,9 @@ void bu03_process(void) {
 void bu03_set_rate_hz(float rate) {
     s_rate_hz = rate;
     if (s_role == BU03_ROLE_ANCHOR) {
-        anchor_set_rate_hz(10); // 控制 RESP 发送节流
+        anchor_set_rate_hz(rate); // 控制 RESP 发送节流
     } else {
-        tag_set_rate_hz(1); // 控制 JSON 上报频率
+        tag_set_rate_hz(rate); // 控制 JSON 上报频率（按传入值）
     }
 }
 

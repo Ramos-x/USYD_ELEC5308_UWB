@@ -180,15 +180,15 @@ static void ui_draw_ready(void) {
 
 
 /* ============ 面向底层的标签距离上报接口 ============ */
-void app_on_tag_ranges(uint32_t count, const uint32_t *anchor_ids, const float *distances_m) {
-    if (!anchor_ids || !distances_m || count == 0) return;
+void app_on_tag_ranges(uint32_t count, const uint32_t *anchor_ids) {
+    if (!anchor_ids || count == 0) return;
 
     /* 缓存最近一次测距（最多 8 个），供 UI 展示 */
     if (count > 8) count = 8;
     s_last_range_count = count;
     for (uint32_t i = 0; i < count; ++i) {
         s_last_range_ids[i] = anchor_ids[i];
-        s_last_ranges[i] = distances_m[i];
+        s_last_ranges[i];
     }
     if (s_ui_state == UI_READY && bu03_get_role() == BU03_ROLE_TAG) {
         ui_draw_ready();
@@ -214,7 +214,7 @@ void app_on_tag_ranges(uint32_t count, const uint32_t *anchor_ids, const float *
         for (uint32_t j = 0; j < count; ++j) {
             if (anchor_ids[j] == id_need) {
                 sel_anchors[sel_n] = anchors[i];
-                sel_dist[sel_n] = distances_m[j];
+                // sel_dist[sel_n] = distances_m[j];
                 sel_n++;
                 break;
             }
