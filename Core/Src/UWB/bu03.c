@@ -60,16 +60,26 @@ static void uart1_kick_dma_if_idle(void) {
 }
 
 static void uart1_write_bytes(const uint8_t *data, uint16_t len) {
+    /* 将大块数据拆成小片段写入，关键区短暂关中断，避免并发写入交叉破坏字符串 */
+    const uint16_t SLICE = 64; // 每次最多写入 64B，控制关中断时长
     while (len) {
-        __disable_irq();
-        uint16_t free = uart1_tx_free();
-        __enable_irq();
-        if (free == 0) {
-            HAL_Delay(0);
-            continue;
-        }
-        uint16_t chunk = (len < free) ? len : free;
+        uint16_t want = (len > SLICE) ? SLICE : len;
 
+        // 等待有空闲
+        uint16_t free;
+        do {
+            __disable_irq();
+            free = uart1_tx_free();
+            if (free == 0) {
+                __enable_irq();
+                HAL_Delay(0);
+            }
+        } while (free == 0);
+
+        uint16_t chunk = (want < free) ? want : free;
+
+        /* 关键区：拷贝 + 推进 head + 触发 DMA，需要保持一致 */
+        /* 注意：为保证 DMA 不读取到未完成拷贝的数据，必须在 kick 之前保持中断关闭 */
         uint16_t first = (uint16_t) (UART1_TX_BUF_SZ - tx_head);
         if (first > chunk) first = chunk;
         memcpy(&uart1_tx_buf[tx_head], data, first);
@@ -80,12 +90,12 @@ static void uart1_write_bytes(const uint8_t *data, uint16_t len) {
             memcpy(&uart1_tx_buf[tx_head], data + first, remain);
             tx_head = (uint16_t) ((tx_head + remain) % UART1_TX_BUF_SZ);
         }
-        data += chunk;
-        len -= chunk;
 
-        __disable_irq();
         uart1_kick_dma_if_idle();
         __enable_irq();
+
+        data += chunk;
+        len  -= chunk;
     }
 }
 
@@ -315,37 +325,35 @@ static anchor_info_t *find_or_alloc_anchor(uint16_t id) {
     return NULL;
 }
 
-/* Tag 侧 FINAL 待发队列 */
+/* Tag 侧 FINAL 单一会话上下文（每轮仅服务一个 Anchor） */
 typedef struct {
-    uint16_t pan, anchor_id;
-    uint8_t seq;
-    uint64_t t_tx1, t_rx2;
-} final_job_t;
+    uint8_t  valid;
+    uint16_t pan;
+    uint16_t anchor_id;
+    uint8_t  seq;
+    uint64_t t_tx1;
+    uint64_t t_rx2;
+    uint64_t t_tx3_plan;
+} final_ctx_t;
 
-#define FINALQ_CAP 8
-static final_job_t s_finalq[FINALQ_CAP];
-static uint8_t s_qhead = 0, s_qtail = 0, s_qcount = 0;
-static uint8_t s_resp_window_over = 0;
-static uint64_t s_last_planned_ttx3 = 0;
+static final_ctx_t s_final = {0};
 
-static inline void finalq_reset(void) { s_qhead = s_qtail = s_qcount = 0; }
-
-static int finalq_push_if_absent(uint16_t pan, uint16_t anchor_id, uint8_t seq, uint64_t t_tx1, uint64_t t_rx2) {
-    for (uint8_t i = 0, idx = s_qhead; i < s_qcount; ++i, idx = (uint8_t) ((idx + 1) % FINALQ_CAP))
-        if (s_finalq[idx].anchor_id == anchor_id) return 0;
-    if (s_qcount >= FINALQ_CAP) return -1;
-    s_finalq[s_qtail] = (final_job_t){.pan = pan, .anchor_id = anchor_id, .seq = seq, .t_tx1 = t_tx1, .t_rx2 = t_rx2};
-    s_qtail = (uint8_t) ((s_qtail + 1) % FINALQ_CAP);
-    s_qcount++;
-    return 1;
+static inline void final_clear(void) {
+    memset(&s_final, 0, sizeof(s_final));
 }
 
-static inline final_job_t *finalq_peek(void) { return s_qcount ? &s_finalq[s_qhead] : NULL; }
+static inline int final_is_valid(void) {
+    return s_final.valid != 0;
+}
 
-static inline void finalq_pop(void) {
-    if (!s_qcount) return;
-    s_qhead = (uint8_t) ((s_qhead + 1) % FINALQ_CAP);
-    s_qcount--;
+static inline void final_set(uint16_t pan, uint16_t anchor_id, uint8_t seq, uint64_t t_tx1, uint64_t t_rx2) {
+    s_final.valid      = 1;
+    s_final.pan        = pan;
+    s_final.anchor_id  = anchor_id;
+    s_final.seq        = seq;
+    s_final.t_tx1      = t_tx1;
+    s_final.t_rx2      = t_rx2;
+    s_final.t_tx3_plan = 0;
 }
 
 /* Tag 会话与状态 */
@@ -362,7 +370,7 @@ static volatile uint32_t g_last_flush_ms_tag = 0;
 
 /* Tag 主动轮询 */
 static uint8_t s_tag_proactive_enabled = 1;
-static uint32_t s_tag_poll_interval_ms = 500; // 你可以改回 1000ms
+static uint32_t s_tag_poll_interval_ms = 0;
 static uint32_t s_tag_last_poll_ms = 0;
 static uint8_t s_tag_seq = 0;
 
@@ -381,8 +389,7 @@ static inline void advance_to_next_anchor(void) {
     s_wait_ack_anchor = 0;
     s_phase = TAG_IDLE;
     s_tx_busy = 0;
-    s_resp_window_over = 0;
-    finalq_reset();
+    final_clear();
     dwt_setrxtimeout(0);
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
@@ -397,6 +404,9 @@ static void tag_proactive_try_send_poll(void) {
     const uint16_t dest = s_poll_targets[s_target_idx];
     s_current_anchor = dest;
 
+    /* 新一轮开始前清理会话 */
+    final_clear();
+
     dwt_forcetrxoff();
     uint8_t tx[32];
     /* !!! 把原来的 g_bcast 改为 dest !!! */
@@ -409,9 +419,6 @@ static void tag_proactive_try_send_poll(void) {
         if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) == DWT_SUCCESS) {
             s_tx_busy = 1;
             s_phase = TAG_WAIT_RESP;
-            s_resp_window_over = 0;
-            s_last_planned_ttx3 = 0;
-            finalq_reset();
         }
     }
 }
@@ -438,20 +445,9 @@ static void tag_on_tx_done(const dwt_cb_data_t *cb) {
             }
         }
 
-        (void) tx3_real; // 可日志
-        finalq_pop();
-        if (s_qcount > 0) {
-            (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            schedule_next_final();
-            return;
-        }
-        if (s_resp_window_over) {
-            s_phase = TAG_IDLE;
-            s_tx_busy = 0;
-            dwt_setrxtimeout(0);
-        } else {
-            s_phase = TAG_WAIT_RESP;
-        }
+        /* 发送 FINAL 后，保持在等待 FACK 的状态，确保 ACK 窗口有效 */
+        dwt_setrxtimeout(ACK_WINDOW_US);
+        s_phase = TAG_FINAL_SCHEDULED;
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
@@ -491,7 +487,7 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
             {
                 uint64_t t_rx3 = uwb_ts40_to_64(ack->t_rx3);
                 char rx3_hex[11]; ts40_to_hex(rx3_hex, t_rx3);
-                uart1_printf("[ACK] acr=%u rx3=0x%s", (unsigned)v.hdr->src, rx3_hex);
+                // uart1_printf("[ACK] acr=%u rx3=0x%s", (unsigned)v.hdr->src, rx3_hex);
 
                 anchor_info_t *ai2 = find_or_alloc_anchor(v.hdr->src);
                 if (ai2) {
@@ -506,8 +502,12 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
                 return;
             }
         }
-        /* 非期望帧：务必重置等待窗口！ */
+        /* 非期望帧：重置等待窗口并记录一次诊断日志 */
         if (s_phase == TAG_FINAL_SCHEDULED) {
+            if (!(s_wait_ack_anchor != 0 && v.hdr->src == s_wait_ack_anchor && v.hdr->dst == g_tag_short)) {
+                uart1_printf("[ACK-UNEXP] src=%u dst=%u expect=%u",
+                             (unsigned) v.hdr->src, (unsigned) v.hdr->dst, (unsigned) s_wait_ack_anchor);
+            }
             dwt_setrxtimeout(ACK_WINDOW_US);                // 重新编程超时
         }
         (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
@@ -538,9 +538,10 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
     dwt_readrxtimestamp(rxts5);
     uint64_t t_rx2 = uwb_ts40_to_64(rxts5);
 
-    /* 入队 FINAL（去重）: FINAL 序号 = RESP.seq + 1 */
-    (void) finalq_push_if_absent(v.hdr->pan, anchor_id, (uint8_t) (v.hdr->seq + 1),
-                                 g_last_poll_tx_ts, t_rx2);
+    /* 设置本轮会话：FINAL 序号 = RESP.seq + 1 */
+    if (!final_is_valid()) {
+        final_set(v.hdr->pan, anchor_id, (uint8_t)(v.hdr->seq + 1), g_last_poll_tx_ts, t_rx2);
+    }
 
     /* ★ 记录本轮交互（以 Anchor 为单位） */
     anchor_info_t *ai = find_or_alloc_anchor(anchor_id);
@@ -568,9 +569,8 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
         ai->updated = 1; /* 本条会被 JSON 带出去 */
     }
 
-
-    /* 从 0→1 时立刻排第一帧 FINAL */
-    if (s_phase == TAG_WAIT_RESP && s_qcount == 1) {
+    /* 立即排程该 Anchor 的 FINAL */
+    if (s_phase == TAG_WAIT_RESP) {
         schedule_next_final();
         return;
     }
@@ -582,23 +582,18 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
 static void tag_on_rx_to(const dwt_cb_data_t *cb) {
     (void) cb;
 
-    // FACK 超时
+    // FACK 超时：视为本 Anchor 结束，推进到下一个
     if (s_phase == TAG_FINAL_SCHEDULED) {
-        /* 等 FACK 超时：视为本 Anchor 结束，推进到下一个 */
         s_wait_ack_anchor = 0;
         advance_to_next_anchor();
         return;
     }
 
-
-    // RESP 窗口超时
-    s_resp_window_over = 1;
+    // RESP 窗口超时：推进到下一个 Anchor
     if (s_phase == TAG_WAIT_RESP) {
-        /* 未收到 RESP：也推进到下一个 Anchor */
         advance_to_next_anchor();
         return;
     }
-
 
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
@@ -609,59 +604,56 @@ static void tag_on_rx_err(const dwt_cb_data_t *cb) {
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
-/* Tag：FINAL 排程 */
+/* Tag：FINAL 排程（单锚版本） */
 static void schedule_next_final(void) {
-    final_job_t *job = finalq_peek();
-    if (!job) return;
-    uint64_t base_ttx3 = (job->t_rx2 + FINAL_DELAY_DTU) & TS_MASK_40;
-    uint64_t t_tx3 = base_ttx3;
-    if (s_last_planned_ttx3) {
-        uint64_t min_next = (s_last_planned_ttx3 + FINAL_CHAIN_GAP_DTU) & TS_MASK_40;
-        t_tx3 = max40(t_tx3, min_next);
-    }
+    if (!final_is_valid()) return;
 
-    /* ★ 记录计划的 TX3 */
-    anchor_info_t *ai = find_or_alloc_anchor(job->anchor_id);
-    if (ai) {
-        ai->tx3_plan = t_tx3;
-        ai->updated = 1;
-    }
+    /* 计划 TX3：相对 RX2 的固定延迟 */
+    uint64_t t_tx3 = (s_final.t_rx2 + FINAL_DELAY_DTU) & TS_MASK_40;
 
+    /* 组并发 FINAL（允许顺延重试，避免“目标时间过近”导致启动失败） */
     uint8_t ftx[64];
-    uint16_t flen = uwb_build_final(ftx, job->seq, job->pan,
-                                    job->anchor_id, g_tag_short,
-                                    job->t_tx1, job->t_rx2, t_tx3);
-    if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
-        dwt_writetxfctrl(flen + 2, 0, 1);
-        dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
-        s_wait_ack_anchor = job->anchor_id;
-        dwt_setrxaftertxdelay(0);
-        dwt_setrxtimeout(ACK_WINDOW_US);
-        if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) == DWT_SUCCESS) {
-            s_last_planned_ttx3 = t_tx3;
-            s_phase = TAG_FINAL_SCHEDULED;
-            return;
+    uint16_t flen;
+    int retries = 0;
+    for (;;) {
+        /* ★ 记录计划的 TX3（每次重试都更新） */
+        anchor_info_t *ai = find_or_alloc_anchor(s_final.anchor_id);
+        if (ai) {
+            ai->tx3_plan = t_tx3;
+            ai->updated = 1;
         }
+        s_final.t_tx3_plan = t_tx3;
+
+        flen = uwb_build_final(ftx, s_final.seq, s_final.pan,
+                               s_final.anchor_id, g_tag_short,
+                               s_final.t_tx1, s_final.t_rx2, t_tx3);
+        if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
+            dwt_writetxfctrl(flen + 2, 0, 1);
+            dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
+            s_wait_ack_anchor = s_final.anchor_id;
+            dwt_setrxaftertxdelay(0);
+            dwt_setrxtimeout(ACK_WINDOW_US);
+            if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) == DWT_SUCCESS) {
+                s_phase = TAG_FINAL_SCHEDULED;
+                return;
+            }
+        }
+
+        /* 启动失败：顺延 FINAL 时间再试，最多重试 2 次 */
+        if (retries < 2) {
+            retries++;
+            t_tx3 = (t_tx3 + FINAL_CHAIN_GAP_DTU) & TS_MASK_40;
+            uart1_printf("[FINAL-RETRY] acr=%u retry=%d", (unsigned)s_final.anchor_id, retries);
+            continue;
+        }
+
+        /* 多次失败：放弃本锚并推进 */
+        break;
     }
-    /* 推迟一格再试 */
-    // t_tx3 = (t_tx3 + FINAL_CHAIN_GAP_DTU) & TS_MASK_40;
-    // flen = uwb_build_final(ftx, job->seq, job->pan,
-    //                        job->anchor_id, g_tag_short,
-    //                        job->t_tx1, job->t_rx2, t_tx3);
-    // if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
-    //     dwt_writetxfctrl(flen + 2, 0, 1);
-    //     dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
-    //     s_wait_ack_anchor = job->anchor_id;
-    //     dwt_setrxaftertxdelay(0);
-    //     dwt_setrxtimeout(ACK_WINDOW_US);
-    //     if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) == DWT_SUCCESS) {
-    //         s_last_planned_ttx3 = t_tx3;
-    //         s_phase = TAG_FINAL_SCHEDULED;
-    //         return;
-    //     }
-    // }
-    /* 彻底失败：丢弃该 job */
-    finalq_pop();
+
+    final_clear();
+    s_wait_ack_anchor = 0;
+    advance_to_next_anchor();
 }
 
 /* Tag：周期任务 & 输出 */
@@ -733,7 +725,7 @@ static void try_flush_json(void) {
 
         /* ★ 输出 JSON：在每个 anchor 下新增 ex{} 与 dt_us{} */
         n = snprintf(out + pos, sizeof(out) - pos,
-                     "%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"tick\":%lu,"
+                     "\n%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"tick\":%lu,"
                      "\"dist_mm\":%ld,"
                      "\"ts\":\"%s\","  /* 兼容旧字段：仍表示 rx2 的 5B */
                      "\"ex\":{\"seq\":%u,"
@@ -842,7 +834,7 @@ void tag_process(void) {
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 /* Anchor 侧短地址与速率节流 */
-static uint16_t g_addr_short = 0x0001;
+static uint16_t g_addr_short = 0x0002;
 uint16_t anchor_get_short(void) { return g_addr_short; }
 void anchor_randomize_short(void) { g_addr_short = 0x0001; } // 可改为UID映射
 
@@ -1100,11 +1092,19 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
             int st = dwt_starttx(DWT_START_TX_DELAYED);
             uart1_printf("[FACK-TX] start=%d len=%u", st, ack_len);
             if (st != DWT_SUCCESS) {
-                dwt_forcetrxoff();
-                dwt_writetxdata(ack_len, ack, 0);
-                dwt_writetxfctrl(ack_len + 2, 0, 1);
-                st = dwt_starttx(DWT_START_TX_IMMEDIATE);
-                uart1_printf("[FACK-TX-IMM] start=%d", st);
+                /* 再尝试一次稍后延迟，给 Tag RX 切换留更大裕量（+200us） */
+                uint64_t t_tx4_retry = (t_tx4 + US_TO_DTU(200)) & TS_MASK_40;
+                dwt_setdelayedtrxtime((uint32_t) (t_tx4_retry >> 8));
+                st = dwt_starttx(DWT_START_TX_DELAYED);
+                uart1_printf("[FACK-TX-RETRY] start=%d", st);
+                if (st != DWT_SUCCESS) {
+                    /* 仍失败才退回立即发送（兜底） */
+                    dwt_forcetrxoff();
+                    dwt_writetxdata(ack_len, ack, 0);
+                    dwt_writetxfctrl(ack_len + 2, 0, 1);
+                    st = dwt_starttx(DWT_START_TX_IMMEDIATE);
+                    uart1_printf("[FACK-TX-IMM] start=%d", st);
+                }
             }
         }
 
