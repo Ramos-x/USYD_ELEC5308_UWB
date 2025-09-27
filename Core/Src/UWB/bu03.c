@@ -144,15 +144,53 @@ static void uart1_printf(const char *fmt, ...) {
 #endif
 
 #define TS_MASK_40 0xFFFFFFFFFFULL
-#ifndef DTU_TO_US_I32
-#define DTU_TO_US_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*1e6 + 0.5) )
-#endif
-#ifndef DTU_TO_MM_I32
-#define DTU_TO_MM_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*SPEED_OF_LIGHT*1000.0 + 0.5) )
-#endif
-#ifndef DTU_TO_NS_I32
-#define DTU_TO_NS_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*1e9 + 0.5) )
-#endif
+// #ifndef DTU_TO_US_I32
+// #define DTU_TO_US_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*1e6 + 0.5) )
+// #endif
+// #ifndef DTU_TO_MM_I32
+// #define DTU_TO_MM_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*SPEED_OF_LIGHT*1000.0 + 0.5) )
+// #endif
+// #ifndef DTU_TO_NS_I32
+// #define DTU_TO_NS_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*1e9 + 0.5) )
+// #endif
+
+/* ---- 无浮点 DTU->time/dist 换算（DW3000）---- */
+/* 注意：结果范围足够；64位乘法 + 32位除法，无需 __int128 */
+
+static inline uint32_t dtu_to_ns_u32(uint64_t d) {
+    // ns = d * 625 / 39936  （+1/2用于四舍五入）
+    const uint32_t NUM = 625, DEN = 39936;
+    return (uint32_t)((d * NUM + (DEN/2)) / DEN);
+}
+
+static inline uint32_t dtu_to_us_u32(uint64_t d) {
+    // us = d * 625 / 39936000
+    const uint32_t NUM = 625, DEN = 39936000;
+    return (uint32_t)((d * NUM + (DEN/2)) / DEN);
+}
+
+static inline uint32_t dtu_to_mm_u32(uint64_t d) {
+    // mm = d * 99,900,849 / 21,299,200
+    const uint32_t NUM = 99900849U, DEN = 21299200U;
+    return (uint32_t)((d * NUM + (DEN/2)) / DEN);
+}
+
+/* 原先的 rel_us() 用它来做换算，完全去掉 double */
+static inline int32_t rel_us(uint64_t newer, uint64_t older) {
+    uint64_t d = (newer - older) & TS_MASK_40;   // 40bit 环形差
+    return (int32_t)dtu_to_us_u32(d);
+}
+
+/* 如果要 ns 或 1mm 级别距离差，也直接用整数版 */
+static inline int32_t rel_ns(uint64_t newer, uint64_t older) {
+    uint64_t d = (newer - older) & TS_MASK_40;
+    return (int32_t)dtu_to_ns_u32(d);
+}
+
+static inline uint32_t dtu_range_mm(uint64_t d) {
+    return dtu_to_mm_u32(d);
+}
+
 
 static inline int after40(uint64_t a, uint64_t b) {
     return (((a - b) & TS_MASK_40) < (1ULL << 39));
@@ -174,25 +212,21 @@ static void ts40_to_hex(char out[11], uint64_t ts) {
     out[10] = '\0';
 }
 
-static inline int32_t rel_us(uint64_t newer, uint64_t older) {
-    uint64_t d = (newer - older) & TS_MASK_40;
-    return DTU_TO_US_I32(d);
-}
-
 /* ================ 公共网络参数 ================ */
 static uint16_t g_pan_id = 0xABCD;
 static const uint16_t g_bcast = 0xFFFF;
 
 /* ======================= TAG 部分 ======================= */
-/* Tag 发送 FINAL 的固定延迟（相对收到 RESP） */
-#define TAG_FINAL_DELAY_US   1000U
-#define FINAL_CHAIN_GAP_US    1000U
-#ifndef RESP_WINDOW_US
+#define FINAL_DELAY_US   800U
+#define FINAL_CHAIN_GAP_US    300U //final 重排延迟
 #define RESP_WINDOW_US       6000U  //当前 800+4*1000
-#endif
 #define ACK_WINDOW_US   6000U      /* FINAL 后等待 FACK 的窗口 */
-#define FINAL_DELAY_DTU  ((uint64_t)((TAG_FINAL_DELAY_US*1e-6)/DWT_TIME_UNITS + 0.5))
+#define FINAL_DELAY_DTU  ((uint64_t)((FINAL_DELAY_US*1e-6)/DWT_TIME_UNITS + 0.5))
 #define FINAL_CHAIN_GAP_DTU US_TO_DTU(FINAL_CHAIN_GAP_US)
+/* 会话过期阈值：从 rx2 到现在超过该时间则判定会话过期（单位us） */
+#ifndef FINAL_SESSION_MAX_AGE_US
+#define FINAL_SESSION_MAX_AGE_US 3000U
+#endif
 
 /* Tag 侧短地址与状态 */
 static uint16_t g_tag_short = 0x1234;
@@ -449,13 +483,13 @@ static void tag_on_tx_done(const dwt_cb_data_t *cb) {
 
         /* 发送 FINAL 后，保持在等待 FACK 的状态，确保 ACK 窗口有效 */
         dwt_setrxtimeout(ACK_WINDOW_US);
-        s_phase = TAG_FINAL_SCHEDULED;
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        s_phase = TAG_FINAL_SCHEDULED;
         return;
     }
     // fallback
-    s_tx_busy = 0;
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    s_tx_busy = 0;
 }
 
 static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
@@ -544,9 +578,14 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
     dwt_readrxtimestamp(rxts5);
     uint64_t t_rx2 = uwb_ts40_to_64(rxts5);
 
-    /* 设置本轮会话：FINAL 序号 = RESP.seq + 1 */
-    if (!final_is_valid()) {
-        final_set(v.hdr->pan, anchor_id, (uint8_t)(v.hdr->seq + 1), g_last_poll_tx_ts, t_rx2);
+    /* 设置本轮会话：FINAL 序号 = RESP.seq + 1（锚变化或序号变化时强制刷新；同一会话也更新基准） */
+    uint8_t new_seq = (uint8_t)(v.hdr->seq + 1);
+    if (!final_is_valid() || s_final.anchor_id != anchor_id || s_final.seq != new_seq) {
+        final_set(v.hdr->pan, anchor_id, new_seq, g_last_poll_tx_ts, t_rx2);
+    } else {
+        /* 同一锚/同一会话：更新 rx2/tx1，防止使用过期的 rx2 */
+        s_final.t_tx1 = g_last_poll_tx_ts;
+        s_final.t_rx2 = t_rx2;
     }
 
     /* ★ 记录本轮交互（以 Anchor 为单位） */
@@ -621,7 +660,6 @@ static void schedule_next_final(void) {
 
     /* 组并发 FINAL（允许顺延重试，避免“目标时间过近”导致启动失败） */
     uint8_t ftx[64];
-    uint16_t flen;
     int retries = 0;
     for (;;) {
         /* ★ 记录计划的 TX3（每次重试都更新） */
@@ -632,22 +670,38 @@ static void schedule_next_final(void) {
         }
         s_final.t_tx3_plan = t_tx3;
 
-        flen = uwb_build_final(ftx, s_final.seq, s_final.pan,
-                               s_final.anchor_id, g_tag_short,
-                               s_final.t_tx1, s_final.t_rx2, t_tx3);
+        const uint16_t flen = uwb_build_final(ftx, s_final.seq, s_final.pan,
+                                        s_final.anchor_id, g_tag_short,
+                                        s_final.t_tx1, s_final.t_rx2, t_tx3);
         if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
             dwt_writetxfctrl(flen + 2, 0, 1);
             dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
             s_wait_ack_anchor = s_final.anchor_id;
             dwt_setrxaftertxdelay(0);
             dwt_setrxtimeout(ACK_WINDOW_US);
-            if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) == DWT_SUCCESS) {
+            int st = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
+            if (st == DWT_SUCCESS) {
                 s_phase = TAG_FINAL_SCHEDULED;
                 return;
+            // } else {
+            //     /* 检查是否“过期/晚了”：过期或晚了则立即放弃该锚，避免对过期会话顺延 */
+            //     uint8_t sys5[5];
+            //     dwt_readsystime(sys5);
+            //     uint64_t t_now = uwb_ts40_to_64(sys5);
+            //     /* 是否晚了：now 在 tx3 之后 */
+            //     int late = !after40(t_tx3, t_now);
+            //     /* 会话年龄：从 rx2 到现在的时间 */
+            //     int32_t proc_us = rel_us(t_now, s_final.t_rx2);
+            //     if (late || (proc_us > (int32_t)FINAL_SESSION_MAX_AGE_US)) {
+            //         final_clear();
+            //         s_wait_ack_anchor = 0;
+            //         advance_to_next_anchor();
+            //         return;
+            //     }
             }
         }
 
-        /* 启动失败：顺延 FINAL 时间再试，最多重试 2 次 */
+        /* 启动失败：顺延 FINAL 时间再试，最多重试 2 次（仅限未过期、未晚的情况） */
         if (retries < 2) {
             retries++;
             t_tx3 = (t_tx3 + FINAL_CHAIN_GAP_DTU) & TS_MASK_40;
@@ -745,7 +799,7 @@ static void try_flush_json(void) {
                      "\"complete\":%u},"
                      "\"dt_us\":{\"tx1_rx2\":%ld,\"rx2_tx3p\":%ld,\"rx2_tx3r\":%ld}"
                      "}",
-                     first ? "\n" : ",\n",
+                     first ? "" : ",",
                      (unsigned) g_anchors[i].id, (unsigned) g_anchors[i].id,
                      (unsigned long) g_anchors[i].last_tick,
                      // dist_mm,
@@ -785,7 +839,7 @@ static void try_flush_json(void) {
     g_last_flush_ms_tag = now;
 }
 
-void tag_set_rate_hz(float rate) {
+void tag_set_rate_hz(const float rate) {
     // if (rate < 0.1f) rate = 0.1f;
     // if (rate > 100.0f) rate = 100.0f;
     // g_min_interval_ms_tag = (uint32_t) (1000.0f / rate + 0.5f);
@@ -842,8 +896,7 @@ void tag_process(void) {
 #define ANCHOR_ID_FIRST         0x0001
 #define ANCHOR_ID_LAST          0x0005
 #define ANCHOR_SLOT_COUNT      (ANCHOR_ID_LAST - ANCHOR_ID_FIRST + 1) /* =5 */
-#define ANCHOR_REPLY_BASE_US    1000U   // 槽0基准
-#define ANCHOR_SLOT_SPACING_US  1000U   // 槽间隔
+#define ANCHOR_REPLY_BASE_US    800U   // 槽0基准
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 /* Anchor 侧短地址与速率节流 */
@@ -893,26 +946,12 @@ static void sess_clear(uint16_t tag) {
         }
 }
 
-static inline uint8_t anchor_slot_index_from_id(uint16_t aid) {
-    int32_t delta = (int32_t) aid - (int32_t) ANCHOR_ID_FIRST;
-    int32_t span = (int32_t) ANCHOR_SLOT_COUNT;
-    int32_t m = delta % span;
-    if (m < 0) m += span;
-    return (uint8_t) m;
-}
-
-static inline uint8_t anchor_slot_index(void) {
-    return anchor_slot_index_from_id(g_addr_short);
-}
-
 static inline uint64_t plan_tx2_from_rx1(uint64_t t_rx1) {
-    uint8_t slot = anchor_slot_index();
-    uint32_t off_us = ANCHOR_REPLY_BASE_US + (uint32_t) slot * ANCHOR_SLOT_SPACING_US;
+    uint32_t off_us = ANCHOR_REPLY_BASE_US;
     return (t_rx1 + US_TO_DTU(off_us)) & TS_MASK_40;
 }
 
 #define ACR_ACK_DELAY_US 1500U
-/* Anchor 侧中断/回调状态 */
 static volatile uint8_t s_sending_resp = 0;
 static volatile uint16_t s_resp_tag_pending = 0;
 
@@ -979,7 +1018,6 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
 
     /* --- POLL --- */
     if (uwb_get_msg_type(&v) == UWB_MSG_POLL) {
-        /* 只响应发给我的 unicast 或广播 */
         if (!(v.hdr->dst == g_addr_short || v.hdr->dst == g_bcast)) {
             (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
             return;
@@ -990,6 +1028,7 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
             (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
             return;
         }
+
         uint8_t rxts5[5];
         dwt_readrxtimestamp(rxts5);
         uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
@@ -1093,7 +1132,7 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
                                           /* t_rx3 */ t_rx3);
         // 发送 FACK 之前：
         dwt_setrxaftertxdelay(0);
-        dwt_setrxtimeout(0); // 0 表示无限等待
+        dwt_setrxtimeout(FINAL_WINDOW_US); // 0 表示无限等待
 
         // 组并发 FACK 之前
         uart1_printf("[FACK-SCHED] tag=%u t_tx4=+%ldus", (unsigned) tag_id, (long) ACR_ACK_DELAY_US);
@@ -1120,14 +1159,10 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
                 }
             }
         }
-
-
         sess_clear(tag_id);
         (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return;
     }
-
-    /* 其他帧忽略 */
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
 
@@ -1171,7 +1206,7 @@ void anchor_process(void) {
 /* ======================= 角色封装（与示例一致） ======================= */
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 20.0f
+#define BU03_RATE_HZ_DEFAULT 2.0f
 #endif
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int s_init_ok = 0;

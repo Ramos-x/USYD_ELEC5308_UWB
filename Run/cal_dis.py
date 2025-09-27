@@ -7,7 +7,6 @@ import time
 import threading
 from queue import Queue, Empty
 from collections import deque
-from collections import deque
 
 import serial  # pip install pyserial
 import re
@@ -18,17 +17,39 @@ DWT_TIME_UNITS = 1.0 / (499.2e6 * 128.0)
 MASK40 = (1 << 40) - 1
 
 # 串口配置
-PORT = "COM5"
+PORT = "COM6"
 BAUD = 2000000
 TIMEOUT = 0.2      # 读超时（秒），用于线程可中断
 
 # 启动后自动零距标定时长（秒）：在这段时间内统计每个 anchor 的平均偏置并用于后续扣除
-CALIB_SECS = 2.0
+CALIB_SECS = 5
+
+# 直接在代码中配置的“手动矫正”参数（单位：米）
+# 全局固定偏置（所有锚共用，正值表示减去该偏置）
+MANUAL_BIAS_GLOBAL_M = 0.0
+# 分 Anchor 偏置（优先级高于全局，例如 {1: 0.12, 2: -0.035}）
+MANUAL_BIAS_PER_ANCHOR_M = {
+    1: 0.000,
+    2: 0.000,
+    3: 0.000,
+    4: 0.000,
+    5: 0.000,
+}
+# 全局缩放系数（用于修正时基或系统性比例误差，1.0 表示不缩放）
+MANUAL_SCALE_GLOBAL = 1.0
+# 分 Anchor 缩放系数（优先级高于全局，例如 {1: 1.0023}）
+MANUAL_SCALE_PER_ANCHOR = {
+    1: 1.0000,
+    2: 1.0000,
+    3: 1.0000,
+    4: 1.0000,
+    5: 1.0000,
+}
 
 # 平滑与离群值抑制
-SMOOTH_WIN = 3       # 中值窗口大小（奇数）
-SMOOTH_ALPHA = 0.9   # EWMA 系数（0.0~1.0，越大越跟随）
-OUTLIER_TH_M = 0.5   # 离群门限（米），超过则以中值替代
+SMOOTH_WIN = 9       # 中值窗口大小（奇数）
+SMOOTH_ALPHA = 0.3   # EWMA 系数（0.0~1.0，越大越跟随）
+OUTLIER_TH_M = 0.5  # 离群门限（米），超过则以中值替代
 
 # -------------------- 工具函数 --------------------
 # 过滤 ANSI/CSI 控制序列（例如 \x1b[...），避免污染日志/JSON 解析
@@ -279,8 +300,14 @@ def main():
                 parts = []
                 for aid, info in items:
                     d_raw = float(info.get('dist_m', float('nan')))
-                    b = bias.get(aid, 0.0) if calibrated else 0.0
-                    d_corr = d_raw - b
+                    # 自动标定偏置（启动阶段均值，需 CALIB_SECS>0 才会生效）
+                    b_auto = bias.get(aid, 0.0) if calibrated else 0.0
+                    # 手动偏置（优先、始终生效）：分 Anchor 优先于全局
+                    b_manual = MANUAL_BIAS_PER_ANCHOR_M.get(aid, MANUAL_BIAS_GLOBAL_M)
+                    # 手动缩放（优先、始终生效）：分 Anchor 优先于全局
+                    s_manual = MANUAL_SCALE_PER_ANCHOR.get(aid, MANUAL_SCALE_GLOBAL)
+
+                    d_corr = (d_raw - b_manual - b_auto) * s_manual
                     if d_corr < 0 or not (d_corr == d_corr):  # 负值或 NaN
                         d_corr = 0.0
 
