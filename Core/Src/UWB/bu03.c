@@ -802,7 +802,6 @@ static void try_flush_json(void) {
                      first ? "" : ",",
                      (unsigned) g_anchors[i].id, (unsigned) g_anchors[i].id,
                      (unsigned long) g_anchors[i].last_tick,
-                     // dist_mm,
                      ts_hex,
                      (unsigned) g_anchors[i].seq_final,
                      h_tx1, h_rx1, h_tx2, h_rx2, h_tx3p, h_tx3r, h_rx3,

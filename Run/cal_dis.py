@@ -7,8 +7,10 @@ import time
 import threading
 from queue import Queue, Empty
 from collections import deque
+import os
 
 import serial  # pip install pyserial
+import serial.tools.list_ports
 import re
 
 # -------------------- 常量（与固件一致） --------------------
@@ -17,34 +19,67 @@ DWT_TIME_UNITS = 1.0 / (499.2e6 * 128.0)
 MASK40 = (1 << 40) - 1
 
 # 串口配置
-PORT = "COM6"
 BAUD = 2000000
 TIMEOUT = 0.2      # 读超时（秒），用于线程可中断
+TARGET_DEVICE_NAME = "USB-SERIAL CH340"  # 目标设备名称
+DEBUG_MODE = False  # 调试模式：打印接收到的所有行
 
-# 启动后自动零距标定时长（秒）：在这段时间内统计每个 anchor 的平均偏置并用于后续扣除
-CALIB_SECS = 5
+def find_serial_port():
+    """自动搜索包含目标设备名称的串口"""
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        if TARGET_DEVICE_NAME in port.description.upper() or \
+                (port.hwid and TARGET_DEVICE_NAME in port.hwid.upper()):
+            return port.device
+    return None
 
-# 直接在代码中配置的“手动矫正”参数（单位：米）
-# 全局固定偏置（所有锚共用，正值表示减去该偏置）
-MANUAL_BIAS_GLOBAL_M = 0.0
-# 分 Anchor 偏置（优先级高于全局，例如 {1: 0.12, 2: -0.035}）
-MANUAL_BIAS_PER_ANCHOR_M = {
-    1: 0.000,
-    2: 0.000,
-    3: 0.000,
-    4: 0.000,
-    5: 0.000,
-}
-# 全局缩放系数（用于修正时基或系统性比例误差，1.0 表示不缩放）
-MANUAL_SCALE_GLOBAL = 1.0
-# 分 Anchor 缩放系数（优先级高于全局，例如 {1: 1.0023}）
-MANUAL_SCALE_PER_ANCHOR = {
-    1: 1.0000,
-    2: 1.0000,
-    3: 1.0000,
-    4: 1.0000,
-    5: 1.0000,
-}
+# 配置文件路径（保存到代码文件所在目录）
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(_script_dir, "anchor_calibration.json")
+
+# 加载或初始化校准配置
+def load_calibration_config():
+    """从配置文件加载校准数据，如果文件不存在则返回默认值"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"警告：无法加载配置文件 {CONFIG_FILE}: {e}")
+
+    # 默认配置
+    return {
+        "bias": {
+            "1": 0.0,
+            "2": 0.0,
+            "3": 0.0,
+            "4": 0.0,
+            "5": 0.0
+        },
+        "scale": {
+            "1": 1.0,
+            "2": 1.0,
+            "3": 1.0,
+            "4": 1.0,
+            "5": 1.0
+        }
+    }
+
+def save_calibration_config(config):
+    """保存校准数据到配置文件"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+        print(f"✓ 校准数据已保存到 {CONFIG_FILE}")
+    except Exception as e:
+        print(f"错误：无法保存配置文件: {e}")
+
+# 加载配置
+calib_config = load_calibration_config()
+
+# 从配置文件读取矫正参数
+MANUAL_BIAS_PER_ANCHOR_M = {int(k): float(v) for k, v in calib_config.get("bias", {}).items()}
+MANUAL_SCALE_PER_ANCHOR = {int(k): float(v) for k, v in calib_config.get("scale", {}).items()}
 
 # 平滑与离群值抑制
 SMOOTH_WIN = 9       # 中值窗口大小（奇数）
@@ -114,23 +149,52 @@ def compute_distance_m(ex: dict):
 
 # -------------------- 线程：串口读取 → 行队列 --------------------
 class SerialReader(threading.Thread):
-    def __init__(self, port: str, baud: int, timeout: float, line_q: Queue, stop_evt: threading.Event):
+    def __init__(self, port: str, baud: int, timeout: float, line_q: Queue, stop_evt: threading.Event, start_evt: threading.Event):
         super().__init__(daemon=True)
         self.port = port
         self.baud = baud
         self.timeout = timeout
         self.line_q = line_q
         self.stop_evt = stop_evt
+        self.start_evt = start_evt
         self.ser = None
+        self.buffer = b''  # 数据缓冲区
 
     def run(self):
+        # 等待启动信号
+        while not self.stop_evt.is_set():
+            if self.start_evt.wait(timeout=0.1):
+                break
+
+        if self.stop_evt.is_set():
+            return
+
+        print("\n>>> 正在搜索串口...")
+        # 如果没有指定端口，自动搜索
+        port_to_use = self.port
+        if not port_to_use or port_to_use == "AUTO":
+            port_to_use = find_serial_port()
+            if not port_to_use:
+                print(f"错误：未找到 '{TARGET_DEVICE_NAME}' 设备")
+                print("可用的串口设备：")
+                ports = serial.tools.list_ports.comports()
+                if ports:
+                    for p in ports:
+                        print(f"  {p.device}: {p.description}")
+                else:
+                    print("  (无)")
+                return
+            print(f">>> 找到设备: {port_to_use}")
+
+        print(f">>> 正在打开串口 {port_to_use}...")
         while not self.stop_evt.is_set():
             try:
                 if self.ser is None:
+                    # 设置串口参数
                     self.ser = serial.Serial(
-                        self.port,
+                        port_to_use,
                         self.baud,
-                        timeout=self.timeout,
+                        timeout=0.1,        # 读取超时（秒），降低以提高响应速度
                         bytesize=serial.EIGHTBITS,
                         parity=serial.PARITY_NONE,
                         stopbits=serial.STOPBITS_ONE,
@@ -139,6 +203,11 @@ class SerialReader(threading.Thread):
                         dsrdtr=False,       # 关闭DSR/DTR
                         write_timeout=0
                     )
+                    # 尝试设置更大的读取缓冲区（如果支持）
+                    try:
+                        self.ser.set_buffer_size(rx_size=65536)
+                    except Exception:
+                        pass
                     # 清空启动时可能残留/协商产生的输入数据
                     try:
                         self.ser.reset_input_buffer()
@@ -146,19 +215,86 @@ class SerialReader(threading.Thread):
                         pass
                     # 小延时，等设备稳定
                     time.sleep(0.05)
-                line = self.ser.readline()  # 读一行（以 \n 结束），bytes
+                    print(f">>> 串口 {port_to_use} 已打开")
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] 串口读取线程正在运行，等待数据...")
+
+                # 先检查是否有数据可读
+                waiting = self.ser.in_waiting
+                if DEBUG_MODE and waiting > 0:
+                    print(f"[DEBUG] 检测到 {waiting} 字节待读取")
+
+                if waiting == 0:
+                    time.sleep(0.01)  # 短暂休眠，避免 CPU 占用过高
+                    continue
+
+                # 直接读取所有可用数据（非阻塞）
+                if DEBUG_MODE:
+                    print(f"[DEBUG] 读取 {waiting} 字节...")
+
+                line = self.ser.read(waiting)
+
+                if DEBUG_MODE:
+                    print(f"[DEBUG] 读取完成")
+
                 if not line:
                     continue
-                try:
-                    text = line.decode('utf-8', errors='ignore').strip()
-                except Exception:
-                    continue
-                # 清洗 ANSI 转义，过滤空行
-                text = strip_ansi(text).strip()
-                if not text:
-                    continue
-                # 将非空文本全部入队，由工作线程决定如何处理（JSON/非JSON）
-                self.line_q.put(text)
+
+                # 累积到缓冲区
+                self.buffer += line
+
+                if DEBUG_MODE:
+                    print(f"[DEBUG] 缓冲区累积，当前大小: {len(self.buffer)} 字节")
+
+                # 从缓冲区提取完整的行（以 \n 分隔）
+                while b'\n' in self.buffer:
+                    pos = self.buffer.find(b'\n')
+                    line_data = self.buffer[:pos]  # 不包含 \n
+                    self.buffer = self.buffer[pos + 1:]  # 跳过 \n
+
+                    # 去除可能的 \r
+                    if line_data.endswith(b'\r'):
+                        line_data = line_data[:-1]
+
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] 提取完整行: {len(line_data)} 字节")
+                        if line_data:
+                            print(f"[DEBUG] 行开头: {repr(line_data[:50])}")
+                            print(f"[DEBUG] 行末尾: {repr(line_data[-50:])}")
+
+                    if not line_data:
+                        if DEBUG_MODE:
+                            print(f"[DEBUG] 空行，跳过")
+                        continue
+
+                    try:
+                        text = line_data.decode('utf-8', errors='ignore').strip()
+                        if DEBUG_MODE:
+                            print(f"[DEBUG] 解码成功: {len(text)} 字符")
+                    except Exception as e:
+                        if DEBUG_MODE:
+                            print(f"[DEBUG] 解码失败: {e}")
+                        continue
+
+                    # 清洗 ANSI 转义
+                    text = strip_ansi(text).strip()
+
+                    if not text:
+                        if DEBUG_MODE:
+                            print(f"[DEBUG] 清洗后为空，跳过")
+                        continue
+
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] 文本入队: {text[:60]}...")
+
+                    # 入队
+                    self.line_q.put(text)
+
+                # 防止缓冲区无限增长
+                if len(self.buffer) > 10000:
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] 警告：缓冲区过大 ({len(self.buffer)} 字节)，保留最后 5000 字节")
+                    self.buffer = self.buffer[-5000:]
             except serial.SerialException as e:
                 # 串口断开/占用，稍后重试
                 print(f"[SerialReader] serial error: {e}", file=sys.stderr)
@@ -174,6 +310,7 @@ class SerialReader(threading.Thread):
         if self.ser is not None:
             try:
                 self.ser.close()
+                print(">>> 串口已关闭")
             except Exception:
                 pass
             self.ser = None
@@ -201,14 +338,32 @@ class Worker(threading.Thread):
             except Empty:
                 continue
 
-            # 非目标 JSON 行：直接丢弃（不打印）
+            # 非目标 JSON 行：直接丢弃
             if not line.startswith('{"role":"tag"'):
+                # 调试：打印非 JSON 行
+                if DEBUG_MODE:
+                    print(f"[DEBUG] 接收到非目标行: {line[:80]}")
                 continue
+
+            # 调试：打印目标 JSON 行
+            if DEBUG_MODE:
+                print(f"[DEBUG] 接收到目标 JSON 行，长度: {len(line)} 字符")
+                # 检查 JSON 是否完整（应该以 } 结尾）
+                if not line.rstrip().endswith('}'):
+                    print(f"[DEBUG] 警告：JSON 不完整，末尾20字符: ...{line[-20:]}")
 
             try:
                 obj = json.loads(line)
-            except Exception:
+                # 成功解析后打印统计信息
+                if DEBUG_MODE:
+                    anchors = obj.get("anchors", [])
+                    print(f"[DEBUG] JSON 解析成功，包含 {len(anchors)} 个 anchors")
+            except Exception as e:
                 # 有时串口会出现拼写/丢括号问题：直接跳过这行
+                if DEBUG_MODE:
+                    print(f"[DEBUG] JSON 解析失败: {e}")
+                    print(f"[DEBUG] 行开头100字符: {line[:100]}")
+                    print(f"[DEBUG] 行结尾100字符: ...{line[-100:]}")
                 continue
 
             anchors = obj.get("anchors", [])
@@ -221,13 +376,34 @@ class Worker(threading.Thread):
                 try:
                     aid = int(a.get("aid"))
                 except Exception:
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] 无法获取 anchor ID")
                     continue
                 ex = a.get("ex", {})
-                # 可选：只在字段 complete==1 时计算
-                # 如果你希望不管 complete 与否，只要 6 戳齐了就算，可以不看 complete
-                dist = compute_distance_m(ex)
-                if dist is None:
+
+                # 只处理 complete==1 的数据
+                if ex.get("complete", 0) != 1:
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] Anchor {aid} 数据不完整 (complete={ex.get('complete', 0)})，跳过")
                     continue
+
+                if DEBUG_MODE:
+                    print(f"[DEBUG] 处理 Anchor {aid}, ex 字段: {list(ex.keys())}")
+
+                dist = compute_distance_m(ex)
+
+                if dist is None:
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] Anchor {aid} 距离计算失败（返回 None）")
+                        # 检查时间戳字段
+                        for k in ["tx1", "rx1", "tx2", "rx2", "tx3r", "tx3p", "rx3"]:
+                            v = ex.get(k, "缺失")
+                            print(f"[DEBUG]   {k}: {v}")
+                    continue
+
+                if DEBUG_MODE:
+                    print(f"[DEBUG] Anchor {aid} 距离计算成功: {dist:.3f}m")
+
                 result[aid] = {
                     "seq": ex.get("seq"),
                     "dist_m": dist,
@@ -244,10 +420,30 @@ class Worker(threading.Thread):
                     for aid, info in result.items():
                         dstore[aid] = info
 
+# -------------------- 命令行输入线程 --------------------
+class CommandReader(threading.Thread):
+    """在后台读取用户输入的命令"""
+    def __init__(self, cmd_q: Queue, stop_evt: threading.Event):
+        super().__init__(daemon=True)
+        self.cmd_q = cmd_q
+        self.stop_evt = stop_evt
+
+    def run(self):
+        while not self.stop_evt.is_set():
+            try:
+                line = input()
+                self.cmd_q.put(line.strip())
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception:
+                pass
+
 # -------------------- 主线程：打印/展示共享对象 --------------------
 def main():
     line_q = Queue(maxsize=1000)
+    cmd_q = Queue()
     stop_evt = threading.Event()
+    serial_start_evt = threading.Event()  # 用于控制串口启动
     lock = threading.Lock()
 
     # 共享状态结构（线程安全）
@@ -256,58 +452,153 @@ def main():
         "anchors": {}   # aid -> { seq, dist_m, ex{} }
     }
 
-    reader = SerialReader(PORT, BAUD, TIMEOUT, line_q, stop_evt)
+    reader = SerialReader("AUTO", BAUD, TIMEOUT, line_q, stop_evt, serial_start_evt)
     worker = Worker(line_q, shared_state, lock, stop_evt)
+    cmd_reader = CommandReader(cmd_q, stop_evt)
 
     reader.start()
     worker.start()
+    cmd_reader.start()
+
+    # 校准模式变量
+    calibration_mode = True  # 启动时为校准模式，等待用户输入
+    measuring = False  # 是否正在测量
+    measure_start_ts = 0.0
+    measure_duration = 3.0  # 测量持续时间（秒）
+    measure_samples = []  # 当前测量的距离样本
+    last_seq = {}  # 记录每个 anchor 最后处理的 seq，避免重复计数
+    target_anchor_id = 0  # 要校准的 Anchor ID
+    actual_distance = 1.0  # 实际距离，默认 1 米
+    serial_started = False  # 串口是否已启动
+
+    # 平滑状态
+    hist = {}       # aid -> deque
+    smooth = {}     # aid -> 上一次平滑值
+
+    print("")
+    print("=" * 60)
+    print("UWB 距离测量与校准系统")
+    print("=" * 60)
+    print(f"目标设备: {TARGET_DEVICE_NAME} (自动搜索)")
+    print(f"当前配置文件: {CONFIG_FILE}")
+    print(f"默认校准距离: {actual_distance}m")
+    print("命令:")
+    print("  <Anchor ID>  - 校准指定的 Anchor (例如: 1, 2, 3...)")
+    print("  d <距离>     - 设置实际距离 (例如: d 1.5)")
+    print("  q            - 退出程序")
+    print("  r            - 开始实时监测模式（完成校准后）")
+    print("=" * 60)
 
     try:
-        # 周期性打印各 anchor 的距离（带零距偏置抵消 + 平滑过滤）
-        start_ts = time.time()
-        bias_sum = {}   # aid -> 累计和
-        bias_cnt = {}   # aid -> 计数
-        bias     = {}   # aid -> learned bias
-        calibrated = False
-
-        # 平滑状态
-        hist = {}       # aid -> deque
-        smooth = {}     # aid -> 上一次平滑值
-
         while True:
-            time.sleep(0.5)
+            # 处理用户命令
+            try:
+                cmd = cmd_q.get_nowait()
+                if cmd.lower() == 'q':
+                    print("退出程序...")
+                    break
+                elif cmd.lower() == 'r':
+                    if calibration_mode:
+                        calibration_mode = False
+                        # 启动串口（如果还未启动）
+                        if not serial_started:
+                            serial_start_evt.set()
+                            serial_started = True
+                        print("\n>>> 进入实时监测模式")
+                    else:
+                        print(">>> 已经在实时监测模式")
+                elif cmd.lower().startswith('d '):
+                    # 设置实际距离
+                    try:
+                        dist = float(cmd[2:].strip())
+                        if dist <= 0:
+                            print("错误：距离必须大于0")
+                        else:
+                            actual_distance = dist
+                            print(f">>> 实际距离已设置为: {actual_distance}m")
+                    except ValueError:
+                        print("错误：距离格式不正确，例如: d 1.5")
+                else:
+                    # 尝试解析为 Anchor ID
+                    try:
+                        aid = int(cmd)
+                        if aid <= 0:
+                            print("错误：Anchor ID 必须大于0")
+                        else:
+                            # 启动串口（如果还未启动）
+                            if not serial_started:
+                                serial_start_evt.set()
+                                serial_started = True
+                            target_anchor_id = aid
+                            measuring = True
+                            measure_start_ts = time.time()
+                            measure_samples.clear()
+                            last_seq.clear()  # 清空 seq 记录
+                            print(f"\n>>> 开始校准 Anchor {target_anchor_id}，实际距离: {actual_distance}m，测量时间: {measure_duration}秒...")
+                    except ValueError:
+                        print(f"未知命令: {cmd}")
+            except Empty:
+                pass
+
             with lock:
                 anchors_copy = dict(shared_state["anchors"])
 
-            now = time.time()
-            if not calibrated and anchors_copy:
-                # 统计启动阶段的零距偏置
-                for aid, info in anchors_copy.items():
-                    d = info.get('dist_m')
-                    if isinstance(d, (int, float)):
-                        bias_sum[aid] = bias_sum.get(aid, 0.0) + float(d)
-                        bias_cnt[aid] = bias_cnt.get(aid, 0) + 1
-                if (now - start_ts) >= CALIB_SECS and bias_cnt:
-                    # 计算每个 anchor 的平均偏置
-                    for aid, cnt in bias_cnt.items():
-                        if cnt > 0:
-                            bias[aid] = bias_sum.get(aid, 0.0) / float(cnt)
-                    calibrated = True
+            # 校准模式 - 测量中
+            if measuring and anchors_copy:
+                elapsed = time.time() - measure_start_ts
+                if elapsed < measure_duration:
+                    # 只收集目标 Anchor 的测量数据
+                    if target_anchor_id in anchors_copy:
+                        info = anchors_copy[target_anchor_id]
+                        seq = info.get('seq')
+                        d = info.get('dist_m')
 
-            if anchors_copy:
-                # 仅输出距离，格式：aid:dist_m（米，三位小数），按 aid 升序
+                        # 只有当 seq 改变时才添加新样本（避免重复计数）
+                        if isinstance(d, (int, float)) and isinstance(seq, int):
+                            if target_anchor_id not in last_seq or last_seq[target_anchor_id] != seq:
+                                measure_samples.append(float(d))
+                                last_seq[target_anchor_id] = seq
+                                if DEBUG_MODE:
+                                    print(f"[DEBUG] 新样本: Anchor {target_anchor_id}, seq={seq}, dist={d:.3f}m, 总样本数={len(measure_samples)}")
+                else:
+                    # 测量完成，计算校准值
+                    measuring = False
+
+                    if len(measure_samples) > 0:
+                        print("\n测量完成！计算校准参数...")
+
+                        global calib_config, MANUAL_BIAS_PER_ANCHOR_M, MANUAL_SCALE_PER_ANCHOR
+
+                        # 计算平均测量距离
+                        avg_measured = sum(measure_samples) / len(measure_samples)
+                        # 计算需要的偏置校正
+                        bias_correction = avg_measured - actual_distance
+
+                        # 更新配置
+                        calib_config["bias"][str(target_anchor_id)] = round(bias_correction, 6)
+                        MANUAL_BIAS_PER_ANCHOR_M[target_anchor_id] = bias_correction
+
+                        print(f"  Anchor {target_anchor_id}: 测量={avg_measured:.3f}m, 偏置={bias_correction:.6f}m (样本数={len(measure_samples)})")
+
+                        # 保存配置
+                        save_calibration_config(calib_config)
+                        print("\n校准完成！可以继续校准其他 Anchor，或输入 'r' 进入实时监测模式")
+                        print("=" * 60)
+                    else:
+                        print(f"\n错误：未收到 Anchor {target_anchor_id} 的数据")
+                        print("=" * 60)
+
+            # 实时监测模式
+            if not calibration_mode and not measuring and anchors_copy:
                 items = sorted(anchors_copy.items(), key=lambda kv: kv[0])
                 parts = []
                 for aid, info in items:
                     d_raw = float(info.get('dist_m', float('nan')))
-                    # 自动标定偏置（启动阶段均值，需 CALIB_SECS>0 才会生效）
-                    b_auto = bias.get(aid, 0.0) if calibrated else 0.0
-                    # 手动偏置（优先、始终生效）：分 Anchor 优先于全局
-                    b_manual = MANUAL_BIAS_PER_ANCHOR_M.get(aid, MANUAL_BIAS_GLOBAL_M)
-                    # 手动缩放（优先、始终生效）：分 Anchor 优先于全局
-                    s_manual = MANUAL_SCALE_PER_ANCHOR.get(aid, MANUAL_SCALE_GLOBAL)
+                    # 应用配置的偏置
+                    b_manual = MANUAL_BIAS_PER_ANCHOR_M.get(aid, 0.0)
+                    s_manual = MANUAL_SCALE_PER_ANCHOR.get(aid, 1.0)
 
-                    d_corr = (d_raw - b_manual - b_auto) * s_manual
+                    d_corr = (d_raw - b_manual) * s_manual
                     if d_corr < 0 or not (d_corr == d_corr):  # 负值或 NaN
                         d_corr = 0.0
 
@@ -317,7 +608,7 @@ def main():
                     med = sorted(q)[len(q)//2] if q else d_corr
                     prev = smooth.get(aid, med)
 
-                    # 离群抑制：同时偏离中值与上次平滑都大于门限，则用中值替代本次观测
+                    # 离群抑制
                     x = d_corr
                     if len(q) >= 3 and abs(d_corr - med) > OUTLIER_TH_M and abs(d_corr - prev) > OUTLIER_TH_M:
                         x = med
@@ -328,12 +619,14 @@ def main():
 
                     parts.append(f"{aid}:{s:.3f}")
                 print(' '.join(parts))
+
     except KeyboardInterrupt:
         pass
     finally:
         stop_evt.set()
         reader.join(timeout=1.0)
         worker.join(timeout=1.0)
+        cmd_reader.join(timeout=1.0)
 
 if __name__ == "__main__":
     main()
