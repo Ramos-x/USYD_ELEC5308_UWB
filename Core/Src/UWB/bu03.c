@@ -1369,7 +1369,7 @@ void anchor_process(void) {
 /* ======================= 角色封装（与示例一致） ======================= */
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 5.0f
+#define BU03_RATE_HZ_DEFAULT 3.0f
 #endif
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int s_init_ok = 0;
