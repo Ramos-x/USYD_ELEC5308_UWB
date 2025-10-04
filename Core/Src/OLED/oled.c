@@ -123,3 +123,88 @@ void OLED_Update(void) {
         oled_write_data(&s_Buffer[OLED_WIDTH * page], OLED_WIDTH);
     }
 }
+
+/* 显示整数（右对齐） */
+void OLED_ShowInt(uint8_t x, uint8_t y, int32_t value, uint8_t width) {
+    char buf[16];
+    int len = snprintf(buf, sizeof(buf), "%ld", (long)value);
+    if (len < 0) return;
+
+    /* 右对齐：计算起始位置 */
+    int pad = (int)width - len;
+    if (pad < 0) pad = 0;
+
+    uint8_t curX = x;
+    /* 前置空格 */
+    for (int i = 0; i < pad; i++) {
+        OLED_DrawChar(curX, y, ' ');
+        curX += 6;
+    }
+    /* 显示数字 */
+    OLED_ShowString(curX, y, buf);
+}
+
+/* 显示浮点数（右对齐） */
+void OLED_ShowFloat(uint8_t x, uint8_t y, float value, uint8_t width, uint8_t decimals) {
+    char buf[16];
+    char fmt[8];
+    snprintf(fmt, sizeof(fmt), "%%.%df", decimals);
+    int len = snprintf(buf, sizeof(buf), fmt, (double)value);
+    if (len < 0) return;
+
+    /* 右对齐 */
+    int pad = (int)width - len;
+    if (pad < 0) pad = 0;
+
+    uint8_t curX = x;
+    for (int i = 0; i < pad; i++) {
+        OLED_DrawChar(curX, y, ' ');
+        curX += 6;
+    }
+    OLED_ShowString(curX, y, buf);
+}
+
+/* 画水平线 */
+void OLED_DrawHLine(uint8_t x, uint8_t y, uint8_t width) {
+    for (uint8_t i = 0; i < width; i++) {
+        set_pixel((uint8_t)(x + i), y, OLED_COLOR_WHITE);
+    }
+}
+
+/* 画垂直线 */
+void OLED_DrawVLine(uint8_t x, uint8_t y, uint8_t height) {
+    for (uint8_t i = 0; i < height; i++) {
+        set_pixel(x, (uint8_t)(y + i), OLED_COLOR_WHITE);
+    }
+}
+
+/* 画矩形框 */
+void OLED_DrawRect(uint8_t x, uint8_t y, uint8_t width, uint8_t height) {
+    OLED_DrawHLine(x, y, width);
+    OLED_DrawHLine(x, (uint8_t)(y + height - 1), width);
+    OLED_DrawVLine(x, y, height);
+    OLED_DrawVLine((uint8_t)(x + width - 1), y, height);
+}
+
+/* 填充矩形 */
+void OLED_FillRect(uint8_t x, uint8_t y, uint8_t width, uint8_t height, OLED_Color color) {
+    for (uint8_t j = 0; j < height; j++) {
+        for (uint8_t i = 0; i < width; i++) {
+            set_pixel((uint8_t)(x + i), (uint8_t)(y + j), color);
+        }
+    }
+}
+
+/* 反转显示区域 */
+void OLED_InvertArea(uint8_t x, uint8_t y, uint8_t width, uint8_t height) {
+    for (uint8_t j = 0; j < height; j++) {
+        for (uint8_t i = 0; i < width; i++) {
+            uint8_t px = (uint8_t)(x + i);
+            uint8_t py = (uint8_t)(y + j);
+            if (px >= OLED_WIDTH || py >= OLED_HEIGHT) continue;
+            uint16_t index = px + (py / 8U) * OLED_WIDTH;
+            uint8_t mask = (uint8_t)(1U << (py & 7U));
+            s_Buffer[index] ^= mask;  /* XOR 实现反转 */
+        }
+    }
+}

@@ -191,7 +191,7 @@ void app_on_tag_ranges(uint32_t count, const uint32_t *anchor_ids) {
         s_last_ranges[i];
     }
     if (s_ui_state == UI_READY && bu03_get_role() == BU03_ROLE_TAG) {
-        ui_draw_ready();
+        // ui_draw_ready();
     }
 
     /* 取当前已标定锚点与坐标 */
@@ -227,7 +227,7 @@ void app_on_tag_ranges(uint32_t count, const uint32_t *anchor_ids) {
             s_tag_pos = tag;
             s_have_tag = 1;
             if (s_ui_state == UI_READY) {
-                ui_draw_ready();
+                // ui_draw_ready();
             }
         }
     }

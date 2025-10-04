@@ -38,6 +38,27 @@ void OLED_DrawChar(uint8_t x, uint8_t y, char c);
 /* 显示 ASCII 字符串（不换行，超出边界自动截断） */
 void OLED_ShowString(uint8_t x, uint8_t y, const char* str);
 
+/* 显示整数（右对齐，width 指定宽度，不足补空格） */
+void OLED_ShowInt(uint8_t x, uint8_t y, int32_t value, uint8_t width);
+
+/* 显示浮点数（右对齐，width 指定总宽度，decimals 指定小数位数） */
+void OLED_ShowFloat(uint8_t x, uint8_t y, float value, uint8_t width, uint8_t decimals);
+
+/* 画水平线 */
+void OLED_DrawHLine(uint8_t x, uint8_t y, uint8_t width);
+
+/* 画垂直线 */
+void OLED_DrawVLine(uint8_t x, uint8_t y, uint8_t height);
+
+/* 画矩形框 */
+void OLED_DrawRect(uint8_t x, uint8_t y, uint8_t width, uint8_t height);
+
+/* 填充矩形 */
+void OLED_FillRect(uint8_t x, uint8_t y, uint8_t width, uint8_t height, OLED_Color color);
+
+/* 反转显示区域（用于高亮） */
+void OLED_InvertArea(uint8_t x, uint8_t y, uint8_t width, uint8_t height);
+
 #ifdef __cplusplus
 }
 #endif

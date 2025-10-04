@@ -144,6 +144,18 @@ static void uart1_printf(const char *fmt, ...) {
 #endif
 
 #define TS_MASK_40 0xFFFFFFFFFFULL
+
+/* ★ DW3000 天线延时校正：自适应调整 */
+#define TX_ANT_DLY_INIT 16400ULL  /* 初始值(根据测量DELTA约600mm,增加约40 DTU) */
+#define TX_ANT_DLY_MIN  15800ULL  /* 最小值：防止异常 */
+#define TX_ANT_DLY_MAX  17000ULL  /* 最大值：防止异常 */
+
+static volatile uint64_t g_tx_ant_dly = TX_ANT_DLY_INIT;  /* 当前天线延时(DTU) */
+static volatile int32_t g_dly_err_acc = 0;  /* 累积误差(DTU) */
+static volatile uint16_t g_dly_samples = 0; /* 采样计数 */
+
+#define DLY_CALIB_SAMPLES 20  /* 每N个样本调整一次(增加以降低噪声影响) */
+#define DLY_CALIB_GAIN 16     /* 调整增益：累积误差 / GAIN(降低以防过调) */
 // #ifndef DTU_TO_US_I32
 // #define DTU_TO_US_I32(dtu64) ( (int32_t)((double)(dtu64)*DWT_TIME_UNITS*1e6 + 0.5) )
 // #endif
@@ -658,7 +670,7 @@ static void schedule_next_final(void) {
     /* 计划 TX3：相对 RX2 的固定延迟 */
     uint64_t t_tx3 = (s_final.t_rx2 + FINAL_DELAY_DTU) & TS_MASK_40;
 
-    /* 组并发 FINAL（允许顺延重试，避免“目标时间过近”导致启动失败） */
+    /* 组并发 FINAL（允许顺延重试，避免"目标时间过近"导致启动失败） */
     uint8_t ftx[64];
     int retries = 0;
     for (;;) {
@@ -670,9 +682,11 @@ static void schedule_next_final(void) {
         }
         s_final.t_tx3_plan = t_tx3;
 
+        /* ★ 报文中填入"预测的实际上空时刻" = 调度基准 + TX天线延时 */
+        uint64_t t_tx3_air = (t_tx3 + g_tx_ant_dly) & TS_MASK_40;
         const uint16_t flen = uwb_build_final(ftx, s_final.seq, s_final.pan,
                                         s_final.anchor_id, g_tag_short,
-                                        s_final.t_tx1, s_final.t_rx2, t_tx3);
+                                        s_final.t_tx1, s_final.t_rx2, t_tx3_air);
         if (dwt_writetxdata(flen, ftx, 0) == DWT_SUCCESS) {
             dwt_writetxfctrl(flen + 2, 0, 1);
             dwt_setdelayedtrxtime((uint32_t) (t_tx3 >> 8));
@@ -845,13 +859,54 @@ void tag_set_rate_hz(const float rate) {
     g_min_interval_ms_tag = (uint32_t) (1000.0f / rate);
 }
 
+/* Tag OLED 显示更新（非阻塞，仅更新缓冲区） */
+static void tag_update_display(void) {
+    OLED_Clear();
+
+    /* 顶部标题栏 */
+    char title[16];
+    snprintf(title, sizeof(title), "TAG:%04X", (unsigned)g_tag_short);
+    OLED_ShowString(0, 0, title);
+
+    /* 分隔线 */
+    OLED_DrawHLine(0, 9, 128);
+
+    /* 显示最多 5 个 Anchor 的距离信息（每行 10 像素高） */
+    uint8_t row = 0;
+    for (int i = 0; i < MAX_ANCHORS && row < 5; ++i) {
+        if (!g_anchors[i].id) continue;
+
+        uint8_t y = (uint8_t)(12 + row * 10);
+
+        /* Anchor ID */
+        char id_str[8];
+        snprintf(id_str, sizeof(id_str), "A%u:", (unsigned)(g_anchors[i].id & 0x0F));
+        OLED_ShowString(0, y, id_str);
+
+        /* 状态指示：交互完成 = '*'，否则 '?' */
+        char status = g_anchors[i].have_xchg ? '*' : '?';
+        OLED_DrawChar(30, y, status);
+
+        /* 相对时延（微秒），用于调试 */
+        if (g_anchors[i].rx2 && g_anchors[i].tx1) {
+            int32_t dt = rel_us(g_anchors[i].rx2, g_anchors[i].tx1);
+            OLED_ShowInt(40, y, dt, 5);
+            OLED_ShowString(70, y, "us");
+        }
+
+        row++;
+    }
+
+    /* 底部：显示天线延时校准值 */
+    // OLED_ShowString(0, 56, "DLY:");
+    // OLED_ShowInt(30, 56, (int32_t)g_tx_ant_dly, 5);
+}
+
 void tag_init(void) {
     dwt_setpanid(g_pan_id);
     dwt_setaddress16(g_tag_short);
 
-    char buf[16];
-    snprintf(buf, sizeof(buf), "TAG:%04X", (unsigned) g_tag_short);
-    OLED_ShowString(64, 8, buf);
+    tag_update_display();
     OLED_Update();
 
     dwt_setcallbacks(tag_on_tx_done, tag_on_rx_ok, tag_on_rx_to, tag_on_rx_err, NULL, NULL);
@@ -883,11 +938,23 @@ void tag_init(void) {
     while (dwt_checkirq()) dwt_isr();
 }
 
+/* Tag 定期更新 OLED（降低更新频率以减少 I2C 开销） */
+static uint32_t s_last_oled_update_ms = 0;
+#define OLED_UPDATE_INTERVAL_MS 500  /* 每 500ms 更新一次 OLED */
+
 void tag_process(void) {
     uwb_periodic_task();
     log_flush();
     try_flush_json();
     dwt_isr();
+
+    /* 定期更新 OLED 显示 */
+    uint32_t now = HAL_GetTick();
+    if ((now - s_last_oled_update_ms) >= OLED_UPDATE_INTERVAL_MS) {
+        s_last_oled_update_ms = now;
+        tag_update_display();
+        OLED_Update();
+    }
 }
 
 /* ======================= ANCHOR 部分 ======================= */
@@ -899,12 +966,17 @@ void tag_process(void) {
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 /* Anchor 侧短地址与速率节流 */
-static uint16_t g_addr_short = 0x0001;
+static uint16_t g_addr_short = 0x0002;
 uint16_t anchor_get_short(void) { return g_addr_short; }
 void anchor_randomize_short(void) { g_addr_short = 0x0001; } // 可改为UID映射
 
 static volatile uint32_t g_min_interval_ms_acr = 1;
 static volatile uint32_t g_last_tx_ms_acr = 0;
+
+/* Anchor OLED 显示统计 */
+static uint32_t s_anchor_rx_count = 0;    /* POLL 接收计数 */
+static uint32_t s_anchor_final_count = 0; /* FINAL 接收计数 */
+static uint32_t s_anchor_last_oled_ms = 0; /* OLED 更新时间戳 */
 
 /* Anchor 会话记录（每 Tag） */
 typedef struct {
@@ -974,10 +1046,43 @@ static void anchor_on_tx_done(const dwt_cb_data_t *cb) {
         if (sess && sess->active) {
             int32_t plan_off_us = rel_us(sess->t_tx2, sess->t_rx1);
             int32_t real_off_us = rel_us(real_tx2, sess->t_rx1);
+
+            /* ★ 自适应校准：计算误差并累积 */
+            int64_t err_dtu = (int64_t)((real_tx2 - sess->t_tx2) & TS_MASK_40);
+            if (err_dtu > (1LL << 39)) err_dtu -= (1LL << 40);  /* 处理40位环形差 */
+
+            __disable_irq();
+            g_dly_err_acc += (int32_t)err_dtu;
+            g_dly_samples++;
+
+            /* 每N个样本调整一次天线延时 */
+            if (g_dly_samples >= DLY_CALIB_SAMPLES) {
+                int32_t avg_err = g_dly_err_acc / (int32_t)g_dly_samples;
+                int32_t adjust = avg_err / DLY_CALIB_GAIN;  /* 渐进调整 */
+
+                uint64_t new_dly = g_tx_ant_dly + adjust;
+                if (new_dly < TX_ANT_DLY_MIN) new_dly = TX_ANT_DLY_MIN;
+                if (new_dly > TX_ANT_DLY_MAX) new_dly = TX_ANT_DLY_MAX;
+
+                /* 计算误差对应的距离 */
+                uint32_t avg_err_mm = dtu_to_mm_u32((uint64_t)((avg_err < 0) ? -avg_err : avg_err));
+
+                uart1_printf("[DLY-CALIB] old=%lu new=%lu avg_err=%ld (%lumm)",
+                             (unsigned long)g_tx_ant_dly, (unsigned long)new_dly,
+                             (long)avg_err, (unsigned long)avg_err_mm);
+
+                g_tx_ant_dly = new_dly;
+                g_dly_err_acc = 0;
+                g_dly_samples = 0;
+            }
+            __enable_irq();
+
             char real_hex[11];
             ts40_to_hex(real_hex, real_tx2);
-            uart1_printf("[RESP] tag=%u real_tx2=0x%s plan_off=%ldus real_off=%ldus",
-                         (unsigned) s_resp_tag_pending, real_hex, (long) plan_off_us, (long) real_off_us);
+            uint32_t delta_mm = dtu_to_mm_u32((uint64_t)((err_dtu < 0) ? -err_dtu : err_dtu));
+            uart1_printf("[RESP] tag=%u real_tx2=0x%s plan_off=%ldus real_off=%ldus DELTA=%ldmm dly=%lu",
+                         (unsigned) s_resp_tag_pending, real_hex, (long) plan_off_us, (long) real_off_us,
+                         (long)delta_mm, (unsigned long)g_tx_ant_dly);
             sess->t_tx2 = real_tx2;
         }
         s_sending_resp = 0;
@@ -1033,20 +1138,22 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
         uint64_t t_rx1 = uwb_ts40_to_64(rxts5);
         uint64_t t_tx2 = plan_tx2_from_rx1(t_rx1);
 
+        /* ★ 报文中填入"预测的实际上空时刻" = 调度基准 + TX天线延时 */
+        uint64_t t_tx2_air = (t_tx2 + g_tx_ant_dly) & TS_MASK_40;
+
         uint16_t tag_id = v.hdr->src;
         ds_sess_t *sess = sess_get_or_alloc(tag_id);
         if (sess) {
             sess->t_rx1 = t_rx1;
-            sess->t_tx2 = t_tx2;
+            sess->t_tx2 = t_tx2_air;  /* ★ 存储预测的实际上空时刻 */
             sess->expect_seq = (uint8_t) (v.hdr->seq + 2);
             sess->tick = now_ms;
         }
-
         uint8_t txbuf[64];
         uint16_t mac_len = uwb_build_resp(txbuf,
                                           (uint8_t) (v.hdr->seq + 1),
                                           v.hdr->pan, tag_id, g_addr_short,
-                                          t_rx1, t_tx2);
+                                          t_rx1, t_tx2_air);
         if (dwt_writetxdata(mac_len, txbuf, 0) == DWT_SUCCESS) {
             dwt_writetxfctrl(mac_len + 2, 0, 1);
             dwt_setrxaftertxdelay(0);
@@ -1057,18 +1164,21 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
             s_resp_tag_pending = tag_id;
             if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) == DWT_SUCCESS) {
                 g_last_tx_ms_acr = now_ms;
+                s_anchor_rx_count++;  /* 统计 POLL 接收次数 */
             } else {
+                s_sending_resp = 0;
                 (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
             }
         } else {
             (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
         } {
             // log
-            char rx1_hex[11], plan_hex[11];
+            char rx1_hex[11], plan_hex[11], air_hex[11];
             ts40_to_hex(rx1_hex, t_rx1);
             ts40_to_hex(plan_hex, t_tx2);
-            uart1_printf("[POLL] tag=%u seq=%u rx1=0x%s plan_tx2=0x%s d_us=%ld",
-                         (unsigned) tag_id, (unsigned) v.hdr->seq, rx1_hex, plan_hex,
+            ts40_to_hex(air_hex, t_tx2_air);
+            uart1_printf("[POLL] tag=%u seq=%u rx1=0x%s plan_tx2=0x%s air_tx2=0x%s d_us=%ld",
+                         (unsigned) tag_id, (unsigned) v.hdr->seq, rx1_hex, plan_hex, air_hex,
                          (long) rel_us(t_tx2, t_rx1));
         }
         return;
@@ -1117,6 +1227,8 @@ static void anchor_on_rx_ok(const dwt_cb_data_t *cb) {
         uint8_t rxts5_final[5];
         dwt_readrxtimestamp(rxts5_final);
         uint64_t t_rx3 = uwb_ts40_to_64(rxts5_final);
+
+        s_anchor_final_count++;  /* 统计 FINAL 接收次数 */
 
         /* 计划一个稍后的 TX4 发 FACK，给RX->TX切换留点裕量 */
         uint64_t t_tx4 = (t_rx3 + US_TO_DTU(ACR_ACK_DELAY_US)) & TS_MASK_40;
@@ -1173,13 +1285,56 @@ void anchor_set_rate_hz(float rate) {
     g_min_interval_ms_acr=(uint32_t) (1000.0f / rate);
 }
 
+/* Anchor OLED 显示更新 */
+static void anchor_update_display(void) {
+    OLED_Clear();
+
+    /* 顶部标题栏 */
+    char title[16];
+    snprintf(title, sizeof(title), "ACR:%04X", (unsigned)g_addr_short);
+    OLED_ShowString(0, 0, title);
+
+    /* 分隔线 */
+    OLED_DrawHLine(0, 9, 128);
+
+    /* 统计信息 */
+    OLED_ShowString(0, 12, "RX:");
+    OLED_ShowInt(24, 12, (int32_t)s_anchor_rx_count, 5);
+
+    OLED_ShowString(0, 22, "TX:");
+    OLED_ShowInt(24, 22, (int32_t)s_anchor_final_count, 5);
+
+    /* 天线延时校准值 */
+    OLED_ShowString(0, 34, "DLY:");
+    OLED_ShowInt(30, 34, (int32_t)g_tx_ant_dly, 5);
+
+    /* 校准采样进度条 */
+    OLED_ShowString(0, 44, "CAL:");
+    uint8_t prog = (uint8_t)((g_dly_samples * 10) / DLY_CALIB_SAMPLES);
+    for (uint8_t i = 0; i < 10; i++) {
+        if (i < prog) {
+            OLED_FillRect((uint8_t)(30 + i * 6), 44, 5, 7, OLED_COLOR_WHITE);
+        } else {
+            OLED_DrawRect((uint8_t)(30 + i * 6), 44, 5, 7);
+        }
+    }
+
+    /* 底部：显示速率 */
+    OLED_ShowString(0, 56, "Rate:");
+    OLED_ShowFloat(36, 56, 1000.0f / (float)g_min_interval_ms_acr, 4, 1);
+    OLED_ShowString(72, 56, "Hz");
+}
+
 void anchor_init(void) {
     dwt_setpanid(g_pan_id);
     dwt_setaddress16(g_addr_short);
 
-    char buf[16];
-    snprintf(buf, sizeof(buf), "ACR:%04X", (unsigned) g_addr_short);
-    OLED_ShowString(0, 8, buf);
+    /* 初始化统计计数 */
+    s_anchor_rx_count = 0;
+    s_anchor_final_count = 0;
+    s_anchor_last_oled_ms = HAL_GetTick();
+
+    anchor_update_display();
     OLED_Update();
 
     dwt_setcallbacks(anchor_on_tx_done, anchor_on_rx_ok, anchor_on_rx_to, anchor_on_rx_err, NULL, NULL);
@@ -1197,15 +1352,24 @@ void anchor_init(void) {
     while (dwt_checkirq()) dwt_isr();
 }
 
+/* Anchor 定期更新 OLED */
 void anchor_process(void) {
     gc_sessions();
     dwt_isr();
+
+    /* 定期更新 OLED */
+    uint32_t now = HAL_GetTick();
+    if ((now - s_anchor_last_oled_ms) >= OLED_UPDATE_INTERVAL_MS) {
+        s_anchor_last_oled_ms = now;
+        anchor_update_display();
+        OLED_Update();
+    }
 }
 
 /* ======================= 角色封装（与示例一致） ======================= */
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 2.0f
+#define BU03_RATE_HZ_DEFAULT 5.0f
 #endif
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int s_init_ok = 0;
