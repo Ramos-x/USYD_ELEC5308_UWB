@@ -81,10 +81,81 @@ calib_config = load_calibration_config()
 MANUAL_BIAS_PER_ANCHOR_M = {int(k): float(v) for k, v in calib_config.get("bias", {}).items()}
 MANUAL_SCALE_PER_ANCHOR = {int(k): float(v) for k, v in calib_config.get("scale", {}).items()}
 
-# 平滑与离群值抑制
-SMOOTH_WIN = 9       # 中值窗口大小（奇数）
-SMOOTH_ALPHA = 0.3   # EWMA 系数（0.0~1.0，越大越跟随）
-OUTLIER_TH_M = 0.5  # 离群门限（米），超过则以中值替代
+# 逐链路预处理参数
+MEDIAN_WIN = 5       # 中值滤波窗口大小（奇数，3-5）
+EMA_ALPHA = 0.3      # 指数滑动平均系数（0.2-0.4，越大越跟随当前值）
+OUTLIER_K = 3.0      # 离群门限倍数（k·σ，通常 2-3）
+NOISE_EST_WIN = 10   # 噪声估计窗口大小
+
+# -------------------- 逐链路预处理器 --------------------
+class LinkPreprocessor:
+    """
+    单条距离链路的预处理器
+    功能：
+    1. 中值滤波（去尖峰）
+    2. 离群检测与处理（基于 k·σ）
+    3. 指数滑动平均 EMA（抑制抖动）
+    4. 噪声估计（σ，用于后续融合权重）
+    """
+    def __init__(self, median_win=MEDIAN_WIN, ema_alpha=EMA_ALPHA,
+                 outlier_k=OUTLIER_K, noise_win=NOISE_EST_WIN):
+        self.median_win = median_win
+        self.ema_alpha = ema_alpha
+        self.outlier_k = outlier_k
+        self.noise_win = noise_win
+
+        # 历史窗口（用于中值和噪声估计）
+        self.history = deque(maxlen=max(median_win, noise_win))
+
+        # EMA 状态
+        self.ema_value = None
+
+        # 噪声估计（标准差）
+        self.noise_sigma = 0.1  # 初始值
+
+    def process(self, raw_value):
+        """
+        处理单个原始测量值
+        返回：(净化后的值, 噪声σ)
+        """
+        # 步骤1：添加到历史窗口
+        self.history.append(raw_value)
+
+        if len(self.history) < 3:
+            # 数据不足，直接返回
+            self.ema_value = raw_value
+            return raw_value, self.noise_sigma
+
+        # 步骤2：中值滤波
+        history_list = list(self.history)
+        median_window = history_list[-self.median_win:] if len(history_list) >= self.median_win else history_list
+        median_val = sorted(median_window)[len(median_window) // 2]
+
+        # 步骤3：估计噪声（MAD - 中位绝对偏差）
+        if len(self.history) >= self.noise_win:
+            noise_window = history_list[-self.noise_win:]
+            median_noise = sorted(noise_window)[len(noise_window) // 2]
+            # MAD = median(|xi - median|)
+            mad = sorted([abs(x - median_noise) for x in noise_window])[len(noise_window) // 2]
+            # σ ≈ 1.4826 * MAD（正态分布假设）
+            self.noise_sigma = max(1.4826 * mad, 0.01)  # 最小 1cm 避免除零
+
+        # 步骤4：离群检测与处理
+        # 如果 |当前值 - 中值| > k·σ，用中值替换
+        if abs(raw_value - median_val) > self.outlier_k * self.noise_sigma:
+            # 检测到离群点，用中值替换
+            filtered_value = median_val
+        else:
+            # 正常值
+            filtered_value = raw_value
+
+        # 步骤5：指数滑动平均 EMA
+        if self.ema_value is None:
+            self.ema_value = filtered_value
+        else:
+            self.ema_value = self.ema_alpha * filtered_value + (1 - self.ema_alpha) * self.ema_value
+
+        return self.ema_value, self.noise_sigma
 
 # -------------------- 工具函数 --------------------
 # 过滤 ANSI/CSI 控制序列（例如 \x1b[...），避免污染日志/JSON 解析
@@ -464,21 +535,23 @@ def main():
     calibration_mode = True  # 启动时为校准模式，等待用户输入
     measuring = False  # 是否正在测量
     measure_start_ts = 0.0
-    measure_duration = 3.0  # 测量持续时间（秒）
+    measure_duration = 5.0  # 测量持续时间（秒）
     measure_samples = []  # 当前测量的距离样本
     last_seq = {}  # 记录每个 anchor 最后处理的 seq，避免重复计数
     target_anchor_id = 0  # 要校准的 Anchor ID
     actual_distance = 1.0  # 实际距离，默认 1 米
     serial_started = False  # 串口是否已启动
 
-    # 平滑状态
-    hist = {}       # aid -> deque
-    smooth = {}     # aid -> 上一次平滑值
+    # 为每个 Anchor 创建独立的预处理器
+    preprocessors = {}  # aid -> LinkPreprocessor
+
+    # 实时监测模式的输出节流
+    last_output_seq = {}  # 记录每个 anchor 上次输出的 seq
 
     print("")
     print("=" * 60)
     print("UWB 距离测量与校准系统")
-    print("=" * 60)
+    print("-" * 60)
     print(f"目标设备: {TARGET_DEVICE_NAME} (自动搜索)")
     print(f"当前配置文件: {CONFIG_FILE}")
     print(f"默认校准距离: {actual_distance}m")
@@ -590,35 +663,46 @@ def main():
 
             # 实时监测模式
             if not calibration_mode and not measuring and anchors_copy:
-                items = sorted(anchors_copy.items(), key=lambda kv: kv[0])
-                parts = []
-                for aid, info in items:
-                    d_raw = float(info.get('dist_m', float('nan')))
-                    # 应用配置的偏置
-                    b_manual = MANUAL_BIAS_PER_ANCHOR_M.get(aid, 0.0)
-                    s_manual = MANUAL_SCALE_PER_ANCHOR.get(aid, 1.0)
+                # 检查是否有新数据（通过 seq 判断）
+                has_new_data = False
+                for aid, info in anchors_copy.items():
+                    seq = info.get('seq')
+                    if isinstance(seq, int):
+                        if aid not in last_output_seq or last_output_seq[aid] != seq:
+                            has_new_data = True
+                            last_output_seq[aid] = seq
 
-                    d_corr = (d_raw - b_manual) * s_manual
-                    if d_corr < 0 or not (d_corr == d_corr):  # 负值或 NaN
-                        d_corr = 0.0
+                # 只有在有新数据时才输出
+                if has_new_data:
+                    items = sorted(anchors_copy.items(), key=lambda kv: kv[0])
+                    parts = []
+                    for aid, info in items:
+                        d_raw = float(info.get('dist_m', float('nan')))
 
-                    q = hist.setdefault(aid, deque(maxlen=SMOOTH_WIN))
-                    q.append(d_corr)
-                    # 中值
-                    med = sorted(q)[len(q)//2] if q else d_corr
-                    prev = smooth.get(aid, med)
+                        # 跳过无效数据
+                        if not (d_raw == d_raw):  # NaN
+                            continue
 
-                    # 离群抑制
-                    x = d_corr
-                    if len(q) >= 3 and abs(d_corr - med) > OUTLIER_TH_M and abs(d_corr - prev) > OUTLIER_TH_M:
-                        x = med
+                        # 应用配置的偏置和缩放
+                        b_manual = MANUAL_BIAS_PER_ANCHOR_M.get(aid, 0.0)
+                        s_manual = MANUAL_SCALE_PER_ANCHOR.get(aid, 1.0)
+                        d_corr = (d_raw - b_manual) * s_manual
 
-                    # 指数平滑
-                    s = SMOOTH_ALPHA * x + (1.0 - SMOOTH_ALPHA) * prev
-                    smooth[aid] = s
+                        if d_corr < 0:
+                            d_corr = 0.0
 
-                    parts.append(f"{aid}:{s:.3f}")
-                print(' '.join(parts))
+                        # 为该 Anchor 创建预处理器（如果不存在）
+                        if aid not in preprocessors:
+                            preprocessors[aid] = LinkPreprocessor()
+
+                        # 逐链路预处理
+                        d_filtered, noise_sigma = preprocessors[aid].process(d_corr)
+
+                        # 输出格式：aid:距离(σ噪声)
+                        parts.append(f"{aid}:{d_filtered:.3f}(σ{noise_sigma*1000:.0f}mm)")
+
+                    if parts:
+                        print(' '.join(parts))
 
     except KeyboardInterrupt:
         pass
