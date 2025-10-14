@@ -349,6 +349,17 @@ typedef struct {
     uint64_t tx3_plan; /* Tag 计划 FINAL(TX3 plan) */
     uint64_t tx3_real; /* Tag 实际 FINAL(TX3 real) */
     uint64_t rx3_ack; /* Anchor 在 FACK 中回传的 RX3（Anchor 收到 FINAL 的时刻） */
+
+    /* ★ 新增：接收质量（在接收到 RESP 时采集） */
+    struct {
+        uint32_t ciaDiag1;      /* 公共诊断 */
+        uint32_t ipatovPeak;    /* 峰值索引/幅度 */
+        uint32_t ipatovPower;   /* 信道功率面积 */
+        uint16_t ipatovFpIndex; /* 首径索引 */
+        uint16_t ipatovAccumCount; /* 累计符号数 */
+        int16_t  xtalOffset;    /* 远端晶振偏移估计 */
+        /* 预留：如需可加 sts* 字段 */
+    } rxq;
 } anchor_info_t;
 
 
@@ -625,6 +636,20 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
         ai->tx3_real = 0;
         ai->rx3_ack = 0;
         ai->have_xchg = 0; /* 还没拿到 FACK */
+
+        /* ★ 新增：采集接收质量（DW3000 RX Diagnostics） */
+        do {
+            dwt_rxdiag_t diag;
+            memset(&diag, 0, sizeof(diag));
+            dwt_readdiagnostics(&diag);
+            ai->rxq.ciaDiag1 = diag.ciaDiag1;
+            ai->rxq.ipatovPeak = diag.ipatovPeak;
+            ai->rxq.ipatovPower = diag.ipatovPower;
+            ai->rxq.ipatovFpIndex = diag.ipatovFpIndex;
+            ai->rxq.ipatovAccumCount = diag.ipatovAccumCount;
+            ai->rxq.xtalOffset = diag.xtalOffset;
+        } while (0);
+
         ai->updated = 1; /* 本条会被 JSON 带出去 */
     }
 
@@ -811,7 +836,8 @@ static void try_flush_json(void) {
                      "\"ex\":{\"seq\":%u,"
                      "\"tx1\":\"%s\",\"rx1\":\"%s\",\"tx2\":\"%s\",\"rx2\":\"%s\",\"tx3p\":\"%s\",\"tx3r\":\"%s\",\"rx3\":\"%s\","
                      "\"complete\":%u},"
-                     "\"dt_us\":{\"tx1_rx2\":%ld,\"rx2_tx3p\":%ld,\"rx2_tx3r\":%ld}"
+                     "\"dt_us\":{\"tx1_rx2\":%ld,\"rx2_tx3p\":%ld,\"rx2_tx3r\":%ld},"
+                     "\"qual\":{\"cia\":%u,\"ipatov\":{\"peak\":%u,\"pwr\":%u,\"fp_idx\":%u,\"acc\":%u},\"xo\":%d}"
                      "}",
                      first ? "" : ",",
                      (unsigned) g_anchors[i].id, (unsigned) g_anchors[i].id,
@@ -820,7 +846,13 @@ static void try_flush_json(void) {
                      (unsigned) g_anchors[i].seq_final,
                      h_tx1, h_rx1, h_tx2, h_rx2, h_tx3p, h_tx3r, h_rx3,
                      (unsigned) g_anchors[i].have_xchg,
-                     (long) dt_tx1_rx2, (long) dt_rx2_tx3p, (long) dt_rx2_tx3r);
+                     (long) dt_tx1_rx2, (long) dt_rx2_tx3p, (long) dt_rx2_tx3r,
+                     (unsigned) g_anchors[i].rxq.ciaDiag1,
+                     (unsigned) g_anchors[i].rxq.ipatovPeak,
+                     (unsigned) g_anchors[i].rxq.ipatovPower,
+                     (unsigned) g_anchors[i].rxq.ipatovFpIndex,
+                     (unsigned) g_anchors[i].rxq.ipatovAccumCount,
+                     (int) g_anchors[i].rxq.xtalOffset);
 
 
         if (n <= 0) break;
@@ -966,7 +998,7 @@ void tag_process(void) {
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 /* Anchor 侧短地址与速率节流 */
-static uint16_t g_addr_short = 0x0002;
+static uint16_t g_addr_short = 0x0001;
 uint16_t anchor_get_short(void) { return g_addr_short; }
 void anchor_randomize_short(void) { g_addr_short = 0x0001; } // 可改为UID映射
 
@@ -1369,7 +1401,7 @@ void anchor_process(void) {
 /* ======================= 角色封装（与示例一致） ======================= */
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 3.0f
+#define BU03_RATE_HZ_DEFAULT 1.0f
 #endif
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int s_init_ok = 0;
