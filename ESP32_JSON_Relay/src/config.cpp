@@ -1,18 +1,26 @@
 #include "config.h"
 
-/** Config */
+/**
+ * 默认配置
+ * 修改这些值可快速切换 Wi-Fi / UART 模式 / 端口等
+ */
 AppConfig appConfig = {
-  /* wifi_ssid      */ "pzs",
-  /* wifi_pass      */ "88888888",
+  // Wi-Fi 信息
+  .wifi_ssid = "iPhone",          // ← 改成你的热点名
+  .wifi_pass = "13841223344",     // ← 改成你的密码
 
-  /* input_from_usb */ false,      // true=USB(Serial)；false=UART1(GPIO16/17)
-  /* baud           */ 2000000,
-  /* uart_rx        */ 16,
-  /* uart_tx        */ 17,
+  // 输入源选择
+  .input_from_usb = false,        // false = 从 UART1 接收 STM32 数据
+                                 // true  = 从 USB 串口接收 (电脑)
+  .baud = 115200,                 // 波特率 (需与 STM32 一致)
+  .uart_rx = 16,                  // UART1 RX 引脚
+  .uart_tx = 17,                  // UART1 TX 引脚
 
-  /* port_good      */ 9000,
-  /* port_bad       */ 9001,
+  // TCP 端口
+  .port_good = 9000,              // 合法 JSON 输出
+  .port_bad  = 9001,              // 不合法 JSON 输出（调试）
 
-  /* line_cap       */ 16384,     // 你的日志比较长，16KB 够用；可调大
-  /* verbose        */ false       //
+  // 缓冲 & 调试
+  .line_cap = 16384,              // 行缓存长度
+  .verbose = true                 // true = 打印详细日志
 };
