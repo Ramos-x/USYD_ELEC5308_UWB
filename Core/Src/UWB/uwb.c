@@ -132,6 +132,9 @@ int UWB_DW3000_Init() {
         return -2;
     }
 
+    /* Enable CIA diagnostics so Tag can read IPATOV/STSS quality metrics */
+    dwt_configciadiag(DW_CIA_DIAG_LOG_ALL);
+
     dwt_txconfig_t txcfg;
     txcfg.PGdly = 0x34;
     txcfg.power = 0x0F1F1F1FUL;

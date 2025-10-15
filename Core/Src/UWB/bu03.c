@@ -16,6 +16,9 @@
 #include "deca_device_api.h"
 #include "bu03.h"
 
+/* Missing prototype in header for 40-bit system time read */
+extern void dwt_readsystime(uint8_t *timestamp);
+
 #include "app.h"
 // #include "anchor.h"
 // #include "tag.h"
@@ -229,10 +232,16 @@ static uint16_t g_pan_id = 0xABCD;
 static const uint16_t g_bcast = 0xFFFF;
 
 /* ======================= TAG 部分 ======================= */
-#define FINAL_DELAY_US   800U
-#define FINAL_CHAIN_GAP_US    300U //final 重排延迟
+#define FINAL_DELAY_US   1000U
+#define FINAL_CHAIN_GAP_US    600U //final 重排延迟（增大以避免延迟启动失败）
 #define RESP_WINDOW_US       6000U  //当前 800+4*1000
 #define ACK_WINDOW_US   6000U      /* FINAL 后等待 FACK 的窗口 */
+
+/* 自适应：延迟TX的最小提前保护时间（us），用于保证延时发送有足够提前量） */
+#define TX_GUARD_US_MIN 200U
+#define TX_GUARD_US_MAX 8000U
+static volatile uint32_t s_tx3_guard_us = 600U; /* 初始保护时间，随后自适应调整 */
+
 #define FINAL_DELAY_DTU  ((uint64_t)((FINAL_DELAY_US*1e-6)/DWT_TIME_UNITS + 0.5))
 #define FINAL_CHAIN_GAP_DTU US_TO_DTU(FINAL_CHAIN_GAP_US)
 /* 会话过期阈值：从 rx2 到现在超过该时间则判定会话过期（单位us） */
@@ -723,20 +732,20 @@ static void schedule_next_final(void) {
                 s_phase = TAG_FINAL_SCHEDULED;
                 return;
             // } else {
-            //     /* 检查是否“过期/晚了”：过期或晚了则立即放弃该锚，避免对过期会话顺延 */
-            //     uint8_t sys5[5];
-            //     dwt_readsystime(sys5);
-            //     uint64_t t_now = uwb_ts40_to_64(sys5);
-            //     /* 是否晚了：now 在 tx3 之后 */
-            //     int late = !after40(t_tx3, t_now);
-            //     /* 会话年龄：从 rx2 到现在的时间 */
-            //     int32_t proc_us = rel_us(t_now, s_final.t_rx2);
-            //     if (late || (proc_us > (int32_t)FINAL_SESSION_MAX_AGE_US)) {
-            //         final_clear();
-            //         s_wait_ack_anchor = 0;
-            //         advance_to_next_anchor();
-            //         return;
-            //     }
+                /* 检查是否“过期/晚了”：过期或晚了则立即放弃该锚，避免对过期会话顺延 */
+                uint8_t sys5[5];
+                dwt_readsystime(sys5);
+                uint64_t t_now = uwb_ts40_to_64(sys5);
+                /* 是否晚了：now 在 tx3 之后 */
+                int late = !after40(t_tx3, t_now);
+                /* 会话年龄：从 rx2 到现在的时间 */
+                int32_t proc_us = rel_us(t_now, s_final.t_rx2);
+                if (late || (proc_us > (int32_t)FINAL_SESSION_MAX_AGE_US)) {
+                    final_clear();
+                    s_wait_ack_anchor = 0;
+                    advance_to_next_anchor();
+                    return;
+                }
             }
         }
 
