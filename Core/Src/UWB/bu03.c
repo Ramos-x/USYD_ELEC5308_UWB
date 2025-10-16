@@ -232,16 +232,10 @@ static uint16_t g_pan_id = 0xABCD;
 static const uint16_t g_bcast = 0xFFFF;
 
 /* ======================= TAG 部分 ======================= */
-#define FINAL_DELAY_US   1000U
+#define FINAL_DELAY_US   1500U
 #define FINAL_CHAIN_GAP_US    600U //final 重排延迟（增大以避免延迟启动失败）
 #define RESP_WINDOW_US       6000U  //当前 800+4*1000
 #define ACK_WINDOW_US   6000U      /* FINAL 后等待 FACK 的窗口 */
-
-/* 自适应：延迟TX的最小提前保护时间（us），用于保证延时发送有足够提前量） */
-#define TX_GUARD_US_MIN 200U
-#define TX_GUARD_US_MAX 8000U
-static volatile uint32_t s_tx3_guard_us = 600U; /* 初始保护时间，随后自适应调整 */
-
 #define FINAL_DELAY_DTU  ((uint64_t)((FINAL_DELAY_US*1e-6)/DWT_TIME_UNITS + 0.5))
 #define FINAL_CHAIN_GAP_DTU US_TO_DTU(FINAL_CHAIN_GAP_US)
 /* 会话过期阈值：从 rx2 到现在超过该时间则判定会话过期（单位us） */
@@ -565,7 +559,6 @@ static void tag_on_rx_ok(const dwt_cb_data_t *cb) {
                 }
 
                 s_wait_ack_anchor = 0;
-                /* 完成本 Anchor，推进 */
                 advance_to_next_anchor();
                 return;
             }
@@ -894,10 +887,26 @@ static void try_flush_json(void) {
 }
 
 void tag_set_rate_hz(const float rate) {
-    // if (rate < 0.1f) rate = 0.1f;
-    // if (rate > 100.0f) rate = 100.0f;
-    // g_min_interval_ms_tag = (uint32_t) (1000.0f / rate + 0.5f);
-    g_min_interval_ms_tag = (uint32_t) (1000.0f / rate);
+    // UART/JSON 上报频率 = rate（Hz）
+    // 将完整一轮(Anchor1→5)的轮询频率也对齐为 rate：
+    // 即每秒进行 rate 轮，每轮包含 ANCHOR_SLOT_COUNT 次 POLL。
+    float r = rate;
+    if (r <= 0.0f) r = 1.0f; // 防御：避免除零
+
+    // 串口输出（JSON 刷新）间隔
+    g_min_interval_ms_tag = (uint32_t)(1000.0f / r);
+    if (g_min_interval_ms_tag == 0) g_min_interval_ms_tag = 1;
+
+    // 每次 POLL 的间隔 = 一轮总时长 / 槽数
+    // 一轮总时长(ms) = 1000/r
+    // 单次 POLL 间隔(ms) = 1000/(r * 槽数)
+    float per_poll_ms_f = 1000.0f / (r * (float)s_target_count);
+    uint32_t per_poll_ms = (uint32_t)(per_poll_ms_f);
+    if (per_poll_ms == 0) per_poll_ms = 1;
+    s_tag_poll_interval_ms = per_poll_ms;
+
+    // 使新的节流立即生效
+    s_tag_last_poll_ms = HAL_GetTick();
 }
 
 /* Tag OLED 显示更新（非阻塞，仅更新缓冲区） */
@@ -1007,7 +1016,7 @@ void tag_process(void) {
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 /* Anchor 侧短地址与速率节流 */
-static uint16_t g_addr_short = 0x0001;
+static uint16_t g_addr_short = 0x0004;
 uint16_t anchor_get_short(void) { return g_addr_short; }
 void anchor_randomize_short(void) { g_addr_short = 0x0001; } // 可改为UID映射
 
@@ -1410,7 +1419,7 @@ void anchor_process(void) {
 /* ======================= 角色封装（与示例一致） ======================= */
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 1.0f
+#define BU03_RATE_HZ_DEFAULT 5.0f
 #endif
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int s_init_ok = 0;

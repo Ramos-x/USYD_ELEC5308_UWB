@@ -8,7 +8,7 @@
 #define UWB_MSG_POLL   0x01
 #define UWB_MSG_RESP   0x02
 #define UWB_MSG_FINAL  0x03
-#define UWB_MSG_FACK   0x04   /* ★ 新增：Final-ACK */
+#define UWB_MSG_FACK   0x04
 
 /* ---------- 802.15.4 帧控制字（FCF） ----------
  * Data Frame + PAN Compression + Dest16 + Src16

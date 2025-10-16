@@ -22,7 +22,8 @@ MASK40 = (1 << 40) - 1
 BAUD = 2000000
 TIMEOUT = 0.2      # 读超时（秒），用于线程可中断
 TARGET_DEVICE_NAME = "USB-SERIAL CH340"  # 目标设备名称
-DEBUG_MODE = False  # 调试模式：打印接收到的所有行
+DEBUG_MODE = False  # 调试模式：保留以兼容旧逻辑（详细调试信息），默认关闭
+OUTPUT_ON_COMPLETE_UART = False  # 新增：当接收到一帧完整的 UART 行时输出到控制台
 
 def find_serial_port():
     """自动搜索包含目标设备名称的串口"""
@@ -357,6 +358,10 @@ class SerialReader(threading.Thread):
 
                     if DEBUG_MODE:
                         print(f"[DEBUG] 文本入队: {text[:60]}...")
+
+                    # 在收到完整的一帧 UART 行后输出到控制台（按需）
+                    if OUTPUT_ON_COMPLETE_UART:
+                        print(text)
 
                     # 入队
                     self.line_q.put(text)
