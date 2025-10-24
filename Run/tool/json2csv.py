@@ -160,7 +160,8 @@ def process_record(js: Dict[str, Any]) -> Optional[List[Any]]:
     row: List[Any] = []
     for aid in (1, 2, 3, 4, 5):
         qa = q_by_aid[aid]
-        row.extend([d_by_aid[aid], qa['peak'], qa['pwr'], qa['fp_idx'], qa['acc'], qa['xo']])
+        d_val = d_by_aid[aid] if d_by_aid[aid] is not None else 0
+        row.extend([d_val, qa['peak'], qa['pwr'], qa['fp_idx'], qa['acc'], qa['xo']])
 
     # 仅当至少一个“距离”有效时才输出（剔除只有质检字段但无距离的记录）
     has_distance = any(d_by_aid[aid] is not None for aid in (1, 2, 3, 4, 5))

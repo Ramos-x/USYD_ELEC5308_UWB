@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test_model.py:*)",
+      "Bash(python3:*)",
+      "Bash(move enhanced_positioning_model.py ..Training )",
+      "Bash(move train_enhanced_model.py ..Training )",
+      "Bash(move realtime_positioning.py ..Training )",
+      "Bash(move test_model.py ..Training )",
+      "Bash(move README_enhanced_model.md ..Training )",
+      "Bash(move 使用说明.md ..Training)",
+      "Bash(python train_enhanced_model.py:*)",
+      "Bash(python:*)",
+      "Bash(.venvScriptspython.exe \"Run\\Training\\train_enhanced_model.py\")",
+      "Bash(\".venv/Scripts/python.exe\" \"Run/Training/train_enhanced_model.py\")",
+      "Bash(chcp 65001)",
+      "Bash($env:PYTHONIOENCODING='utf-8')",
+      "Bash(PYTHONIOENCODING=utf-8 \".venv/Scripts/python.exe\":*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
