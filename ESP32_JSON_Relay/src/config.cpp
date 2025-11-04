@@ -6,8 +6,8 @@
  */
 AppConfig appConfig = {
   // Wi-Fi 信息
-  .wifi_ssid = "iPhone",          // ← 改成你的热点名
-  .wifi_pass = "13841223344",     // ← 改成你的密码
+  .wifi_ssid = "pzs",          // ← 改成你的热点名
+  .wifi_pass = "88888888",     // ← 改成你的密码
 
   // 输入源选择
   .input_from_usb = false,        // false = 从 UART1 接收 STM32 数据
