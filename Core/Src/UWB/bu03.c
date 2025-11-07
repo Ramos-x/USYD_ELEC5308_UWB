@@ -452,6 +452,11 @@ static inline void advance_to_next_anchor(void) {
     s_phase = TAG_IDLE;
     s_tx_busy = 0;
     final_clear();
+
+    /* ★ 修复：重置时间基准，让下一个锚点立即轮询
+     * 避免因当前锚点超时耗时导致下一个锚点被延迟 */
+    s_tag_last_poll_ms = HAL_GetTick() - s_tag_poll_interval_ms;
+
     dwt_setrxtimeout(0);
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 }
@@ -763,8 +768,12 @@ static void schedule_next_final(void) {
 void uwb_periodic_task(void) {
     if (!s_tag_proactive_enabled) return;
     uint32_t now = HAL_GetTick();
-    if ((now - s_tag_last_poll_ms) >= s_tag_poll_interval_ms) {
-        s_tag_last_poll_ms = now;
+
+    /* ★ 修复：只在IDLE且不忙时才认为可以发送并更新时间基准
+     * 避免因busy跳过发送但时间基准已更新，导致下个锚点交互被延迟 */
+    if (s_phase == TAG_IDLE && !s_tx_busy &&
+        (now - s_tag_last_poll_ms) >= s_tag_poll_interval_ms) {
+        s_tag_last_poll_ms = now;  // 只在真正尝试发送时更新时间基准
         tag_proactive_try_send_poll();
     }
 }
@@ -1016,7 +1025,7 @@ void tag_process(void) {
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 /* Anchor 侧短地址与速率节流 */
-static uint16_t g_addr_short = 0x0005;
+static uint16_t g_addr_short = 0x0000;
 uint16_t anchor_get_short(void) { return g_addr_short; }
 void anchor_randomize_short(void) { g_addr_short = 0x0001; } // 可改为UID映射
 
@@ -1419,7 +1428,7 @@ void anchor_process(void) {
 /* ======================= 角色封装（与示例一致） ======================= */
 /* 默认定位频率（Hz） */
 #ifndef BU03_RATE_HZ_DEFAULT
-#define BU03_RATE_HZ_DEFAULT 5.0f
+#define BU03_RATE_HZ_DEFAULT 4.0f
 #endif
 static float s_rate_hz = BU03_RATE_HZ_DEFAULT;
 static int s_init_ok = 0;
