@@ -1,6 +1,6 @@
 """
-训练增强型UWB定位模型
-使用现有的out_1m.csv和out_2m.csv数据训练距离校正模型
+Train Enhanced UWB Positioning Model
+Use existing out_1m.csv and out_2m.csv data to train distance correction model
 """
 
 import os
@@ -12,17 +12,17 @@ from enhanced_positioning_model import (
     ChannelQualityFeatureExtractor
 )
 
-# 设置中文显示
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
+# Set font for plotting
+plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 
 def main():
     print("=" * 80)
-    print("增强型UWB定位系统 - 模型训练")
+    print("Enhanced UWB Positioning System - Model Training")
     print("=" * 80)
 
-    # 1. 数据文件和真实距离
+    # 1. Data files and true distances
     csv_files = [
         'out_1m.csv',
         'out_1.5m.csv',
@@ -31,43 +31,43 @@ def main():
     ]
 
     true_distances = [
-        1.0,  # out_1m.csv的真实距离是1米
+        1.0,  # out_1m.csv true distance is 1 meter
         1.5,
-        2.0,  # out_2m.csv的真实距离是2米
+        2.0,  # out_2m.csv true distance is 2 meters
         2.5
     ]
 
-    # 检查文件是否存在
+    # Check if files exist
     script_dir = os.path.dirname(os.path.abspath(__file__))
     full_paths = []
     for csv_file in csv_files:
         full_path = os.path.join(script_dir, csv_file)
         if not os.path.exists(full_path):
-            print(f"错误: 找不到文件 {full_path}")
+            print(f"Error: File not found {full_path}")
             return
         full_paths.append(full_path)
-        print(f"找到数据文件: {csv_file}")
+        print(f"Found data file: {csv_file}")
 
-    print(f"\n真实距离: {true_distances}")
+    print(f"\nTrue distances: {true_distances}")
 
-    # 2. 创建模型
+    # 2. Create model
     print("\n" + "=" * 80)
-    print("创建距离校正模型...")
+    print("Creating distance correction model...")
     model = DistanceCorrectionModel(model_type='gradient_boosting')
 
-    # 3. 加载训练数据
-    print("\n加载训练数据...")
+    # 3. Load training data
+    print("\nLoading training data...")
     training_df = model.load_training_data(full_paths, true_distances)
 
-    print(f"总数据量: {len(training_df)} 条")
-    print(f"Anchor分布:")
+    print(f"Total samples: {len(training_df)} records")
+    print(f"Anchor distribution:")
     for aid in sorted(training_df['anchor_id'].unique()):
         count = len(training_df[training_df['anchor_id'] == aid])
-        print(f"  Anchor {aid}: {count} 条")
+        print(f"  Anchor {aid}: {count} records")
 
-    # 4. 数据统计分析
+    # 4. Data statistical analysis
     print("\n" + "=" * 80)
-    print("数据统计分析:")
+    print("Data Statistical Analysis:")
     for aid in sorted(training_df['anchor_id'].unique()):
         anchor_data = training_df[training_df['anchor_id'] == aid]
         measured = anchor_data['measured_distance'].values
@@ -78,20 +78,20 @@ def main():
         std = np.std(error)
 
         print(f"\nAnchor {aid}:")
-        print(f"  测量距离 - 平均: {np.mean(measured):.4f}m, 标准差: {np.std(measured):.4f}m")
-        print(f"  误差 - 平均: {np.mean(error):.4f}m, MAE: {mae:.4f}m, 标准差: {std:.4f}m")
-        print(f"  信道质量 - SNR估算: {np.mean(anchor_data['peak'] / anchor_data['acc']):.2f}")
+        print(f"  Measured distance - Mean: {np.mean(measured):.4f}m, Std: {np.std(measured):.4f}m")
+        print(f"  Error - Mean: {np.mean(error):.4f}m, MAE: {mae:.4f}m, Std: {std:.4f}m")
+        print(f"  Channel quality - SNR estimate: {np.mean(anchor_data['peak'] / anchor_data['acc']):.2f}")
 
-    # 5. 训练模型
+    # 5. Train model
     print("\n" + "=" * 80)
-    print("开始训练模型...")
+    print("Starting model training...")
     results = model.train(training_df, n_estimators=200, max_depth=10)
 
-    # 6. 输出训练结果
+    # 6. Output training results
     print("\n" + "=" * 80)
-    print("训练结果汇总:")
+    print("Training Results Summary:")
     print("-" * 80)
-    print(f"{'Anchor':<8} {'样本数':<10} {'校正前MAE':<15} {'校正后MAE':<15} {'改善率':<10}")
+    print(f"{'Anchor':<8} {'Samples':<10} {'MAE Before':<15} {'MAE After':<15} {'Improvement':<12}")
     print("-" * 80)
 
     for aid in sorted(results.keys()):
@@ -100,17 +100,17 @@ def main():
               f"{r['test_mae_before']:<15.4f} {r['test_mae_after']:<15.4f} "
               f"{r['improvement']:<10.2f}%")
 
-    # 7. 保存模型
+    # 7. Save model
     model_path = os.path.join(script_dir, 'uwb_distance_correction_model.pkl')
     model.save_model(model_path)
 
-    # 8. 可视化结果
+    # 8. Visualize results
     print("\n" + "=" * 80)
-    print("生成可视化图表...")
+    print("Generating visualization plots...")
 
-    # 为每个anchor创建对比图
+    # Create comparison plots for each anchor
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    fig.suptitle('距离校正效果对比', fontsize=16, fontweight='bold')
+    fig.suptitle('Distance Correction Comparison', fontsize=16, fontweight='bold')
 
     for idx, aid in enumerate(sorted(results.keys())):
         if idx >= 5:
@@ -122,7 +122,7 @@ def main():
 
         anchor_data = training_df[training_df['anchor_id'] == aid]
 
-        # 提取特征并预测
+        # Extract features and predict
         corrected_distances = []
         for _, row_data in anchor_data.iterrows():
             channel_quality = {
@@ -143,35 +143,35 @@ def main():
         true_dist = anchor_data['true_distance'].values
         corrected = np.array(corrected_distances)
 
-        # 绘制散点图
-        ax.scatter(true_dist, measured, alpha=0.3, s=20, label='校正前', color='red')
-        ax.scatter(true_dist, corrected, alpha=0.3, s=20, label='校正后', color='blue')
+        # Plot scatter points
+        ax.scatter(true_dist, measured, alpha=0.3, s=20, label='Before Correction', color='red')
+        ax.scatter(true_dist, corrected, alpha=0.3, s=20, label='After Correction', color='blue')
 
-        # 绘制理想线
+        # Plot ideal line
         min_val = min(true_dist.min(), measured.min(), corrected.min())
         max_val = max(true_dist.max(), measured.max(), corrected.max())
-        ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5, label='理想线')
+        ax.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5, label='Ideal Line')
 
-        ax.set_xlabel('真实距离 (m)')
-        ax.set_ylabel('测量/校正距离 (m)')
+        ax.set_xlabel('True Distance (m)')
+        ax.set_ylabel('Measured/Corrected Distance (m)')
         ax.set_title(f'Anchor {aid}')
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-    # 删除多余的子图
+    # Remove extra subplots
     if len(results) < 6:
         axes[1, 2].remove()
 
     plt.tight_layout()
 
-    # 保存图表
+    # Save plot
     plot_path = os.path.join(script_dir, 'correction_comparison.png')
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f"图表已保存到: {plot_path}")
+    print(f"Plot saved to: {plot_path}")
 
-    # 9. 创建误差分布图
+    # 9. Create error distribution plots
     fig2, axes2 = plt.subplots(1, 2, figsize=(12, 5))
-    fig2.suptitle('误差分布对比', fontsize=16, fontweight='bold')
+    fig2.suptitle('Error Distribution Comparison', fontsize=16, fontweight='bold')
 
     all_errors_before = []
     all_errors_after = []
@@ -205,34 +205,34 @@ def main():
         all_errors_before.extend(errors_before)
         all_errors_after.extend(errors_after)
 
-    # 直方图
-    axes2[0].hist(all_errors_before, bins=50, alpha=0.7, label='校正前', color='red')
-    axes2[0].hist(all_errors_after, bins=50, alpha=0.7, label='校正后', color='blue')
-    axes2[0].set_xlabel('误差 (m)')
-    axes2[0].set_ylabel('频数')
-    axes2[0].set_title('误差分布直方图')
+    # Histogram
+    axes2[0].hist(all_errors_before, bins=50, alpha=0.7, label='Before Correction', color='red')
+    axes2[0].hist(all_errors_after, bins=50, alpha=0.7, label='After Correction', color='blue')
+    axes2[0].set_xlabel('Error (m)')
+    axes2[0].set_ylabel('Frequency')
+    axes2[0].set_title('Error Distribution Histogram')
     axes2[0].legend()
     axes2[0].grid(True, alpha=0.3)
 
-    # 箱线图
+    # Box plot
     axes2[1].boxplot([all_errors_before, all_errors_after],
-                     labels=['校正前', '校正后'])
-    axes2[1].set_ylabel('误差 (m)')
-    axes2[1].set_title('误差分布箱线图')
+                     labels=['Before Correction', 'After Correction'])
+    axes2[1].set_ylabel('Error (m)')
+    axes2[1].set_title('Error Distribution Box Plot')
     axes2[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
     error_plot_path = os.path.join(script_dir, 'error_distribution.png')
     plt.savefig(error_plot_path, dpi=150, bbox_inches='tight')
-    print(f"误差分布图已保存到: {error_plot_path}")
+    print(f"Error distribution plot saved to: {error_plot_path}")
 
     print("\n" + "=" * 80)
-    print("训练完成!")
-    print(f"模型文件: {model_path}")
-    print(f"可视化结果: {plot_path}, {error_plot_path}")
+    print("Training Complete!")
+    print(f"Model file: {model_path}")
+    print(f"Visualization results: {plot_path}, {error_plot_path}")
     print("=" * 80)
 
-    # 显示图表
+    # Display plots
     plt.show()
 
 
