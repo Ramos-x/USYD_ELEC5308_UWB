@@ -1,10 +1,3 @@
-/****************  uwb_tag_anchor.c  (merged)  ****************
- * - Merge of tag.c + anchor.c
- * - Role select via PB2(BOOT1): 0=Anchor, 1=Tag
- * - UART ring buffer shared
- * - Distinct callbacks: tag_on_* / anchor_on_*
- * - Distinct globals for rates, session etc. to avoid conflicts
- *************************************************************/
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -16,12 +9,9 @@
 #include "deca_device_api.h"
 #include "bu03.h"
 
-/* Missing prototype in header for 40-bit system time read */
 extern void dwt_readsystime(uint8_t *timestamp);
 
 #include "app.h"
-// #include "anchor.h"
-// #include "tag.h"
 #include "uwb_frames.h"
 #include "OLED/oled.h"
 
@@ -1377,7 +1367,6 @@ static void anchor_update_display(void) {
             OLED_DrawRect((uint8_t)(30 + i * 6), 44, 5, 7);
         }
     }
-
     /* 底部：显示速率 */
     OLED_ShowString(0, 56, "Rate:");
     OLED_ShowFloat(36, 56, 1000.0f / (float)g_min_interval_ms_acr, 4, 1);

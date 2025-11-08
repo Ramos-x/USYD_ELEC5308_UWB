@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import re
+import csv
 import serial
 import serial.tools.list_ports
 import numpy as np
@@ -14,6 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from collections import deque
 import time
+from datetime import datetime
 from enhanced_positioning_model import (
     DistanceCorrectionModel,
     EnhancedPositioningSystem
@@ -22,21 +24,37 @@ from enhanced_positioning_model import (
 # ANSI转义字符正则表达式
 ANSI_RE = re.compile(r"\x1B\[[0-9;?]*[ -/]*[@-~]")
 
+# DW1000 时间戳常量
+MASK40 = (1 << 40) - 1  # 40位掩码
+DWT_TIME_UNITS = 1.0 / (499.2e6 * 128.0)  # ≈ 15.65e-12 s
+SPEED_OF_LIGHT = 299702547.0  # m/s
+
 
 def strip_ansi(s: str) -> str:
     """移除ANSI转义字符"""
     return ANSI_RE.sub('', s)
 
 
+def hex5_to_u40(h: str) -> int:
+    """将10位十六进制字符串转换为40位无符号整数"""
+    return int(h, 16) & MASK40
+
+
+def rel40(newer: int, older: int) -> int:
+    """计算40位环形计数器的差值"""
+    return (newer - older) & MASK40
+
+
 class RealtimePositioning:
     """实时定位系统"""
 
-    def __init__(self, model_path, anchor_positions=None, debug=False):
+    def __init__(self, model_path, anchor_positions=None, debug=False, csv_output=None):
         """
         参数:
             model_path: str, 模型文件路径
             anchor_positions: dict, 锚点坐标 {anchor_id: [x, y, z]}
             debug: bool, 是否启用调试模式
+            csv_output: str, CSV输出文件路径(可选)
         """
         # 加载模型
         print("加载距离校正模型...")
@@ -66,6 +84,13 @@ class RealtimePositioning:
         # 调试模式
         self.debug = debug
 
+        # CSV输出
+        self.csv_output = csv_output
+        self.csv_file = None
+        self.csv_writer = None
+        if csv_output:
+            self._init_csv_writer()
+
         # 统计
         self.total_updates = 0
         self.total_lines = 0
@@ -73,6 +98,76 @@ class RealtimePositioning:
         self.role_mismatches = 0
         self.insufficient_anchors = 0
         self.start_time = time.time()
+
+    def _init_csv_writer(self):
+        """初始化CSV写入器"""
+        try:
+            # 使用 buffering=1 启用行缓冲，每写入一行就立即刷新
+            self.csv_file = open(self.csv_output, 'w', newline='', encoding='utf-8', buffering=1)
+            self.csv_writer = csv.writer(self.csv_file)
+
+            # 写入表头
+            header = [
+                'timestamp', 'elapsed_time',
+                'x', 'y', 'z',
+                'velocity', 'is_static',
+                'anchor_count',
+                'a1_measured', 'a1_filtered', 'a1_corrected',
+                'a2_measured', 'a2_filtered', 'a2_corrected',
+                'a3_measured', 'a3_filtered', 'a3_corrected',
+                'a4_measured', 'a4_filtered', 'a4_corrected',
+                'a5_measured', 'a5_filtered', 'a5_corrected'
+            ]
+            self.csv_writer.writerow(header)
+            self.csv_file.flush()
+            print(f"CSV日志已启用: {self.csv_output}")
+        except Exception as e:
+            print(f"警告: 无法创建CSV文件: {e}")
+            self.csv_file = None
+            self.csv_writer = None
+
+    def _write_csv_row(self, result):
+        """写入一行CSV数据"""
+        if not self.csv_writer:
+            return
+
+        try:
+            pos = result['position']
+            elapsed = time.time() - self.start_time
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+            # 基本信息
+            row = [
+                timestamp,
+                f"{elapsed:.3f}",
+                f"{pos[0]:.6f}",
+                f"{pos[1]:.6f}",
+                f"{pos[2]:.6f}",
+                f"{result['velocity']:.6f}",
+                1 if result['is_static'] else 0,
+                len(result['distances'])
+            ]
+
+            # 每个anchor的距离数据
+            for aid in range(1, 6):
+                if aid in result['distances']:
+                    dist_data = result['distances'][aid]
+                    row.extend([
+                        f"{dist_data['raw_distance']:.6f}",  # 修复: 使用 raw_distance 而不是 measured_distance
+                        f"{dist_data['filtered_distance']:.6f}",
+                        f"{dist_data['corrected_distance']:.6f}"
+                    ])
+                else:
+                    row.extend(['', '', ''])  # 该anchor无数据
+
+            self.csv_writer.writerow(row)
+            self.csv_file.flush()
+        except Exception as e:
+            # 总是打印CSV写入错误，帮助调试
+            print(f"\n警告: CSV写入错误: {e}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
 
     def find_serial_port(self):
         """自动查找串口"""
@@ -135,6 +230,8 @@ class RealtimePositioning:
             for anchor in data.get('anchors', []):
                 aid = anchor.get('aid')
                 if aid is None:
+                    if self.debug:
+                        print(f"[DEBUG]   跳过anchor: 无aid字段")
                     continue
 
                 # 获取扩展数据
@@ -142,8 +239,15 @@ class RealtimePositioning:
                 qual = anchor.get('qual', {})
                 ipatov = qual.get('ipatov', {})
 
+                if self.debug:
+                    print(f"[DEBUG]   处理 Anchor {aid}:")
+                    print(f"[DEBUG]     ex字段存在: {bool(ex)}")
+                    print(f"[DEBUG]     complete字段: {ex.get('complete')}")
+
                 # 检查是否有完整的交互数据
                 if not ex.get('complete'):
+                    if self.debug:
+                        print(f"[DEBUG]     跳过: complete不为1")
                     continue
 
                 # 计算DS-TWR距离
@@ -154,33 +258,58 @@ class RealtimePositioning:
                 tx3r_hex = ex.get('tx3r', '0000000000')
                 rx3_hex = ex.get('rx3', '0000000000')
 
-                # 转换为64位整数
-                tx1 = int(tx1_hex, 16)
-                rx1 = int(rx1_hex, 16)
-                tx2 = int(tx2_hex, 16)
-                rx2 = int(rx2_hex, 16)
-                tx3 = int(tx3r_hex, 16)
-                rx3 = int(rx3_hex, 16)
+                if self.debug:
+                    print(f"[DEBUG]     时间戳: tx1={tx1_hex}, rx1={rx1_hex}, tx2={tx2_hex}")
+                    print(f"[DEBUG]             rx2={rx2_hex}, tx3r={tx3r_hex}, rx3={rx3_hex}")
 
-                # DS-TWR计算 (参考bu03.c中的逻辑)
-                DWT_TIME_UNITS = 1.0 / (499.2e6 * 128.0)
-                SPEED_OF_LIGHT = 299702547.0
+                # 检查是否所有时间戳都有效
+                if tx1_hex == '0000000000' or rx1_hex == '0000000000' or \
+                   tx2_hex == '0000000000' or rx2_hex == '0000000000' or \
+                   tx3r_hex == '0000000000' or rx3_hex == '0000000000':
+                    if self.debug:
+                        print(f"[DEBUG]     跳过: 时间戳为0")
+                    continue
 
-                # 计算时间差 (40位环形)
-                def time_diff(newer, older):
-                    diff = (newer - older) & 0xFFFFFFFFFF
-                    return diff * DWT_TIME_UNITS
+                # 转换为40位无符号整数(关键修复!)
+                tx1 = hex5_to_u40(tx1_hex)    # Tag发送第1次
+                rx1 = hex5_to_u40(rx1_hex)    # Anchor收到tx1
+                tx2 = hex5_to_u40(tx2_hex)    # Anchor回复
+                rx2 = hex5_to_u40(rx2_hex)    # Tag收到tx2
+                tx3 = hex5_to_u40(tx3r_hex)   # Tag发送第3次
+                rx3 = hex5_to_u40(rx3_hex)    # Anchor收到tx3
 
-                tround1 = time_diff(rx2, tx1)
-                treply1 = time_diff(tx2, rx1)
-                tround2 = time_diff(rx3, tx3)
-                treply2 = time_diff(tx3, rx2)
+                # 计算时间差(40位环形计数器)
+                Tround1 = rel40(rx2, tx1)     # Tag域: TX1 -> RX2
+                Treply2 = rel40(tx3, rx2)     # Tag域: RX2 -> TX3
+                Treply1 = rel40(tx2, rx1)     # Anchor域: RX1 -> TX2
+                Tround2 = rel40(rx3, tx2)     # Anchor域: TX2 -> RX3
+
+                # 有效性检查
+                if Tround1 <= 0 or Tround2 <= 0 or Treply1 <= 0 or Treply2 <= 0:
+                    if self.debug:
+                        print(f"[DEBUG]     跳过: 时间差为负或零")
+                    continue
+
+                # 转换为秒
+                tround1 = Tround1 * DWT_TIME_UNITS
+                treply1 = Treply1 * DWT_TIME_UNITS
+                tround2 = Tround2 * DWT_TIME_UNITS
+                treply2 = Treply2 * DWT_TIME_UNITS
+
+                if self.debug:
+                    print(f"[DEBUG]     tround1={tround1:.9f}s, treply1={treply1:.9f}s")
+                    print(f"[DEBUG]     tround2={tround2:.9f}s, treply2={treply2:.9f}s")
 
                 # ToF
                 tof = (tround1 * tround2 - treply1 * treply2) / (tround1 + tround2 + treply1 + treply2)
                 distance = tof * SPEED_OF_LIGHT
 
+                if self.debug:
+                    print(f"[DEBUG]     ToF={tof:.9f}s, 距离={distance:.3f}m")
+
                 if distance < 0 or distance > 100:
+                    if self.debug:
+                        print(f"[DEBUG]     跳过: 距离超出范围 ({distance:.3f}m)")
                     continue
 
                 # 提取信道质量参数
@@ -197,12 +326,21 @@ class RealtimePositioning:
                     'channel_quality': channel_quality
                 }
 
+                if self.debug:
+                    print(f"[DEBUG]     ✓ 成功添加测量数据")
+
             return measurements
 
         except json.JSONDecodeError:
             return None
         except Exception as e:
-            print(f"解析错误: {e}")
+            if self.debug:
+                import traceback
+                print(f"[DEBUG] 解析异常: {e}")
+                print(f"[DEBUG] 堆栈跟踪:")
+                traceback.print_exc()
+            else:
+                print(f"解析错误: {e}")
             return None
 
     def process_realtime(self, callback=None):
@@ -315,6 +453,9 @@ class RealtimePositioning:
                                       f"Anchors: {len(measurements)}   ",
                                       end='', flush=True)
 
+                            # 写入CSV
+                            self._write_csv_row(result)
+
                             # 回调
                             if callback:
                                 callback(result)
@@ -355,6 +496,10 @@ class RealtimePositioning:
         if self.serial_port:
             self.serial_port.close()
             print("串口已关闭")
+
+        if self.csv_file:
+            self.csv_file.close()
+            print(f"CSV文件已保存: {self.csv_output}")
 
 
 class RealtimeVisualizer:
@@ -451,11 +596,11 @@ def main():
 
     # 锚点坐标 (需要根据实际标定结果修改)
     anchor_positions = {
-        1: [0.0, 0.0, 1.0],      # Anchor 1
-        2: [3.0, 0.0, 1.0],      # Anchor 2
-        3: [3.0, 3.0, 1.0],      # Anchor 3
-        4: [0.0, 3.0, 1.0],      # Anchor 4
-        5: [1.5, 1.5, 2.5],      # Anchor 5
+        1: [0.3, 0.3, 0.6],      # Anchor 1
+        2: [3.3, 0.3, 1.82],      # Anchor 2
+        3: [3.3, 3.6, 0.52],      # Anchor 3
+        4: [0.1, 3.6, 1.63],      # Anchor 4
+        5: [1.65, 2.08, 0.75],      # Anchor 5
     }
 
     print("\n当前锚点坐标配置:")
@@ -467,8 +612,15 @@ def main():
     # 询问是否启用调试模式
     use_debug = input("\n是否启用调试模式? (y/n): ").lower().strip() == 'y'
 
+    # 询问是否保存CSV
+    use_csv = input("\n是否保存定位数据到CSV? (y/n): ").lower().strip() == 'y'
+    csv_output = None
+    if use_csv:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_output = os.path.join(script_dir, f'positioning_log_{timestamp}.csv')
+
     # 创建定位系统
-    positioning = RealtimePositioning(model_path, anchor_positions, debug=use_debug)
+    positioning = RealtimePositioning(model_path, anchor_positions, debug=use_debug, csv_output=csv_output)
 
     # 连接串口
     if not positioning.connect_serial():

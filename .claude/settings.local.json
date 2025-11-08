@@ -15,7 +15,13 @@
       "Bash(\".venv/Scripts/python.exe\" \"Run/Training/train_enhanced_model.py\")",
       "Bash(chcp 65001)",
       "Bash($env:PYTHONIOENCODING='utf-8')",
-      "Bash(PYTHONIOENCODING=utf-8 \".venv/Scripts/python.exe\":*)"
+      "Bash(PYTHONIOENCODING=utf-8 \".venv/Scripts/python.exe\":*)",
+      "Bash(\".venv\\Scripts\\python.exe\" visualize_positioning.py)",
+      "Bash(\"..\\..\\..\\..\\USYD_ELEC5308_UWB\\.venv\\Scripts\\python.exe\" visualize_positioning.py)",
+      "Bash(\"D:\\Sync\\Syncthing\\Bucket\\Study\\USYD\\USYD_ELEC5308_UWB\\.venv\\Scripts\\python.exe\":*)",
+      "Bash(tree:*)",
+      "Bash(pip install:*)",
+      "Bash(move:*)"
     ],
     "deny": [],
     "ask": []

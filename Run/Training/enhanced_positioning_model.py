@@ -480,6 +480,20 @@ class EnhancedPositioningSystem:
             5: np.array([1.5, 1.5, 2.0]),
         }
 
+        # 位置历史和滤波（用于异常检测和平滑）
+        self.position_history = []
+        self.max_history = 10
+        self.position_filter_x = KalmanFilter1D(process_variance=0.05, measurement_variance=0.3)
+        self.position_filter_y = KalmanFilter1D(process_variance=0.05, measurement_variance=0.3)
+        self.position_filter_z = KalmanFilter1D(process_variance=0.05, measurement_variance=0.3)
+
+        # 定位范围限制（根据实际环境设置）
+        self.position_bounds = {
+            'x': (-1.0, 5.0),  # 锚点范围外留1米余量
+            'y': (-1.0, 5.0),
+            'z': (-1.0, 3.5)   # Z轴高度限制
+        }
+
     def set_anchor_positions(self, positions):
         """
         设置锚点坐标
@@ -577,9 +591,41 @@ class EnhancedPositioningSystem:
         except:
             return None
 
+    def is_position_valid(self, position):
+        """
+        检查位置是否合理
+
+        参数:
+            position: np.array([x, y, z])
+
+        返回:
+            bool: True表示合理, False表示异常
+        """
+        if position is None:
+            return False
+
+        # 1. 检查范围
+        if not (self.position_bounds['x'][0] <= position[0] <= self.position_bounds['x'][1]):
+            return False
+        if not (self.position_bounds['y'][0] <= position[1] <= self.position_bounds['y'][1]):
+            return False
+        if not (self.position_bounds['z'][0] <= position[2] <= self.position_bounds['z'][1]):
+            return False
+
+        # 2. 检查与历史位置的连续性（防止跳变）
+        if len(self.position_history) > 0:
+            last_pos = self.position_history[-1]
+            displacement = np.linalg.norm(position - last_pos)
+
+            # 如果位移超过1米，认为是异常跳变
+            if displacement > 1.0:
+                return False
+
+        return True
+
     def estimate_position(self, measurements):
         """
-        完整的定位流程
+        完整的定位流程（增强版 - 带异常检测和位置滤波）
 
         参数:
             measurements: dict, {
@@ -614,14 +660,36 @@ class EnhancedPositioningSystem:
         }
 
         # 多边定位
-        position = self.multilateration(filtered_distances)
+        raw_position = self.multilateration(filtered_distances)
 
         # 运动状态
         is_static = self.motion_detector.is_static()
         velocity = self.motion_detector.get_velocity_estimate()
 
+        # 位置合理性检查和滤波
+        final_position = raw_position
+
+        if self.is_position_valid(raw_position):
+            # 位置合理，应用卡尔曼滤波平滑
+            filtered_x = self.position_filter_x.update(raw_position[0])
+            filtered_y = self.position_filter_y.update(raw_position[1])
+            filtered_z = self.position_filter_z.update(raw_position[2])
+            final_position = np.array([filtered_x, filtered_y, filtered_z])
+
+            # 更新历史
+            self.position_history.append(final_position)
+            if len(self.position_history) > self.max_history:
+                self.position_history.pop(0)
+        else:
+            # 位置异常，使用上次有效位置
+            if len(self.position_history) > 0:
+                final_position = self.position_history[-1]
+            else:
+                # 没有历史，返回None
+                final_position = None
+
         return {
-            'position': position,
+            'position': final_position,
             'is_static': is_static,
             'velocity': velocity,
             'distances': processed
