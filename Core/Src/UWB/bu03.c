@@ -217,6 +217,10 @@ static void ts40_to_hex(char out[11], uint64_t ts) {
     out[10] = '\0';
 }
 
+/* ================ 重构控制开关 ================ */
+#define USE_REFACTORED_TAG    1  // 1=使用重构后的Tag实现, 0=使用原实现
+#define USE_REFACTORED_ANCHOR 1  // 1=使用重构后的Anchor实现, 0=使用原实现
+
 /* ================ 公共网络参数 ================ */
 static uint16_t g_pan_id = 0xABCD;
 static const uint16_t g_bcast = 0xFFFF;
@@ -433,6 +437,355 @@ static const uint16_t s_poll_targets[] = {0x0001, 0x0002, 0x0003, 0x0004, 0x0005
 static const uint8_t s_target_count = sizeof(s_poll_targets) / sizeof(s_poll_targets[0]);
 static uint8_t s_target_idx = 0; /* 当前要轮询的目标在上面数组里的索引 */
 static uint16_t s_current_anchor = 0; /* 当前这轮交互的 Anchor 短地址（发 POLL 时确定） */
+
+#if USE_REFACTORED_TAG
+/* ============================================================
+ * Tag侧重构：统一状态机和数据结构
+ * ============================================================ */
+
+/* 统一的Tag状态 */
+typedef enum {
+    TAG_ST_IDLE = 0,      // 空闲
+    TAG_ST_POLL_TX,       // POLL发送中
+    TAG_ST_WAIT_RESP,     // 等待RESP
+    TAG_ST_FINAL_TX,      // FINAL发送中
+    TAG_ST_WAIT_FACK      // 等待FACK
+} tag_state_e;
+
+/* 统一的Tag上下文（替换分散的全局变量） */
+typedef struct {
+    tag_state_e state;
+    uint8_t target_idx;
+    uint16_t target_anchor;
+    uint8_t seq;
+    uint8_t retry;
+    uint32_t state_entry_ms;
+
+    // 时间戳（统一管理）
+    uint64_t tx1;         // Tag发送POLL
+    uint64_t rx2;         // Tag接收RESP
+    uint64_t tx3_plan;    // 计划发送FINAL
+    uint64_t tx3_real;    // 实际发送FINAL
+    uint64_t rx1_an;      // Anchor的RX1（从RESP获取）
+    uint64_t tx2_an;      // Anchor的TX2（从RESP获取）
+    uint64_t rx3_an;      // Anchor的RX3（从FACK获取）
+
+    // 诊断
+    dwt_rxdiag_t diag;
+} tag_ctx_t;
+
+static tag_ctx_t g_tag_refactored_ctx = {0};
+
+/* 统一的延迟发送配置 */
+typedef struct {
+    uint8_t delayed;       // 0=立即, 1=延迟
+    uint64_t tx_time;      // 延迟时间（DTU）
+    uint16_t retry_step;   // 重试步长（us）
+    uint8_t max_retry;     // 最大重试次数
+    uint8_t rx_en;         // RX使能
+    uint32_t rx_to;        // RX超时（us）
+} tx_cfg_t;
+
+/* 统一的延迟发送函数 */
+static int unified_tx(const uint8_t *buf, uint16_t len, const tx_cfg_t *cfg) {
+    uint64_t t = cfg->tx_time;
+
+    for (uint8_t i = 0; i <= cfg->max_retry; i++) {
+        if (dwt_writetxdata(len, (uint8_t*)buf, 0) != DWT_SUCCESS) {
+            return -1;
+        }
+        dwt_writetxfctrl(len + 2, 0, 1);
+
+        if (cfg->rx_en) {
+            dwt_setrxaftertxdelay(0);
+            dwt_setrxtimeout(cfg->rx_to);
+        }
+
+        int ret;
+        if (cfg->delayed) {
+            // 检查是否过期
+            uint8_t now5[5];
+            dwt_readsystime(now5);
+            uint64_t tnow = uwb_ts40_to_64(now5);
+            if (!after40(t, tnow)) {
+                uart1_printf("[TX-LATE] t=0x%010llX now=0x%010llX",
+                            (unsigned long long)(t & TS_MASK_40),
+                            (unsigned long long)(tnow & TS_MASK_40));
+                return -2;  // 过期
+            }
+
+            dwt_setdelayedtrxtime((uint32_t)(t >> 8));
+            ret = dwt_starttx((cfg->rx_en ? DWT_RESPONSE_EXPECTED : 0) |
+                             DWT_START_TX_DELAYED);
+        } else {
+            ret = dwt_starttx(cfg->rx_en ?
+                             (DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) :
+                             DWT_START_TX_IMMEDIATE);
+        }
+
+        if (ret == DWT_SUCCESS) {
+            return 0;  // 成功
+        }
+
+        // 重试
+        if (i < cfg->max_retry && cfg->delayed) {
+            t = (t + US_TO_DTU(cfg->retry_step)) & TS_MASK_40;
+            uart1_printf("[TX-RETRY] retry=%u new_t=0x%010llX",
+                        i + 1, (unsigned long long)(t & TS_MASK_40));
+        }
+    }
+    return -1;  // 失败
+}
+
+/* Tag状态转换 */
+static void tag_set_state(tag_state_e st) {
+    if (g_tag_refactored_ctx.state != st) {
+        uart1_printf("[STATE] %d->%d", g_tag_refactored_ctx.state, st);
+    }
+    g_tag_refactored_ctx.state = st;
+    g_tag_refactored_ctx.state_entry_ms = HAL_GetTick();
+    g_tag_refactored_ctx.retry = 0;
+}
+
+/* Tag推进到下一个Anchor */
+static void tag_advance_anchor(void) {
+    // 保存完整交互结果
+    if (g_tag_refactored_ctx.target_anchor && g_tag_refactored_ctx.rx3_an) {
+        anchor_info_t *ai = find_or_alloc_anchor(g_tag_refactored_ctx.target_anchor);
+        if (ai) {
+            ai->tx1 = g_tag_refactored_ctx.tx1;
+            ai->rx2 = g_tag_refactored_ctx.rx2;
+            ai->rx1_resp = g_tag_refactored_ctx.rx1_an;
+            ai->tx2_resp = g_tag_refactored_ctx.tx2_an;
+            ai->tx3_plan = g_tag_refactored_ctx.tx3_plan;
+            ai->tx3_real = g_tag_refactored_ctx.tx3_real;
+            ai->rx3_ack = g_tag_refactored_ctx.rx3_an;
+            ai->seq_final = g_tag_refactored_ctx.seq;
+            ai->have_xchg = 1;
+            ai->updated = 1;
+            ai->last_tick = HAL_GetTick();
+
+            // 保存5字节时间戳（兼容旧格式）
+            uint8_t ts5[5] = {
+                (uint8_t)(ai->rx2 & 0xFF), (uint8_t)((ai->rx2 >> 8) & 0xFF),
+                (uint8_t)((ai->rx2 >> 16) & 0xFF), (uint8_t)((ai->rx2 >> 24) & 0xFF),
+                (uint8_t)((ai->rx2 >> 32) & 0xFF)
+            };
+            memcpy(ai->ts, ts5, 5);
+
+            memcpy(&ai->rxq, &g_tag_refactored_ctx.diag, sizeof(dwt_rxdiag_t));
+        }
+    }
+
+    // 推进索引
+    g_tag_refactored_ctx.target_idx =
+        (g_tag_refactored_ctx.target_idx + 1) % s_target_count;
+
+    // 重置上下文
+    memset(&g_tag_refactored_ctx, 0, sizeof(g_tag_refactored_ctx));
+    g_tag_refactored_ctx.state = TAG_ST_IDLE;
+
+    // 立即开始下一轮轮询
+    s_tag_last_poll_ms = HAL_GetTick() - s_tag_poll_interval_ms;
+
+    // 恢复RX
+    dwt_setrxtimeout(0);
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Tag发送POLL */
+static void tag_send_poll_refactored(void) {
+    g_tag_refactored_ctx.target_anchor = s_poll_targets[g_tag_refactored_ctx.target_idx];
+    g_tag_refactored_ctx.seq = s_tag_seq++;
+
+    uint8_t tx[32];
+    uint16_t len = uwb_build_poll(tx, g_tag_refactored_ctx.seq, g_pan_id,
+                                  g_tag_refactored_ctx.target_anchor, g_tag_short);
+
+    tx_cfg_t cfg = {
+        .delayed = 0,
+        .tx_time = 0,
+        .retry_step = 0,
+        .max_retry = 0,
+        .rx_en = 1,
+        .rx_to = RESP_WINDOW_US
+    };
+
+    if (unified_tx(tx, len, &cfg) == 0) {
+        tag_set_state(TAG_ST_POLL_TX);
+    } else {
+        uart1_printf("[POLL-FAIL]");
+        tag_advance_anchor();
+    }
+}
+
+/* Tag处理RESP */
+static void tag_handle_resp_refactored(const uwb_frame_view_t *v) {
+    // 验证来源
+    if (v->hdr->src != g_tag_refactored_ctx.target_anchor) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    // 验证负载
+    if (v->payload_len < sizeof(pl_resp_t)) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    // 提取时间戳
+    const pl_resp_t *pr = (const pl_resp_t*)v->payload;
+    g_tag_refactored_ctx.rx1_an = uwb_ts40_to_64(pr->t_rx1);
+    g_tag_refactored_ctx.tx2_an = uwb_ts40_to_64(pr->t_rx2);
+
+    uint8_t rxts5[5];
+    dwt_readrxtimestamp(rxts5);
+    g_tag_refactored_ctx.rx2 = uwb_ts40_to_64(rxts5);
+
+    // 采集RX诊断
+    dwt_readdiagnostics(&g_tag_refactored_ctx.diag);
+
+    // 发送FINAL
+    g_tag_refactored_ctx.tx3_plan = (g_tag_refactored_ctx.rx2 + FINAL_DELAY_DTU) & TS_MASK_40;
+    uint64_t tx3_air = (g_tag_refactored_ctx.tx3_plan + g_tx_ant_dly) & TS_MASK_40;
+
+    uint8_t ftx[64];
+    uint16_t flen = uwb_build_final(ftx, (uint8_t)(g_tag_refactored_ctx.seq + 1), g_pan_id,
+                                   g_tag_refactored_ctx.target_anchor, g_tag_short,
+                                   g_tag_refactored_ctx.tx1, g_tag_refactored_ctx.rx2, tx3_air);
+
+    tx_cfg_t cfg = {
+        .delayed = 1,
+        .tx_time = g_tag_refactored_ctx.tx3_plan,
+        .retry_step = FINAL_CHAIN_GAP_US,
+        .max_retry = 2,
+        .rx_en = 1,
+        .rx_to = ACK_WINDOW_US
+    };
+
+    int ret = unified_tx(ftx, flen, &cfg);
+    if (ret == 0) {
+        tag_set_state(TAG_ST_FINAL_TX);
+    } else if (ret == -2) {
+        uart1_printf("[FINAL-EXPIRED] anchor=%u", g_tag_refactored_ctx.target_anchor);
+        tag_advance_anchor();
+    } else {
+        uart1_printf("[FINAL-FAIL] anchor=%u", g_tag_refactored_ctx.target_anchor);
+        tag_advance_anchor();
+    }
+}
+
+/* Tag处理FACK */
+static void tag_handle_fack_refactored(const uwb_frame_view_t *v) {
+    // 验证来源
+    if (v->hdr->src != g_tag_refactored_ctx.target_anchor) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    // 提取RX3
+    if (v->payload_len >= sizeof(pl_fack_t)) {
+        const pl_fack_t *ack = (const pl_fack_t*)v->payload;
+        g_tag_refactored_ctx.rx3_an = uwb_ts40_to_64(ack->t_rx3);
+
+        uart1_printf("[FACK-OK] anchor=%u", g_tag_refactored_ctx.target_anchor);
+
+        // 交互完成，推进到下一个Anchor
+        tag_advance_anchor();
+    } else {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+}
+
+/* Tag回调：TX完成 */
+static void tag_on_tx_refactored(const dwt_cb_data_t *cb) {
+    (void)cb;
+    uint8_t ts5[5];
+    dwt_readtxtimestamp(ts5);
+    uint64_t ts = uwb_ts40_to_64(ts5);
+
+    if (g_tag_refactored_ctx.state == TAG_ST_POLL_TX) {
+        g_tag_refactored_ctx.tx1 = ts;
+        g_last_poll_tx_ts = ts;  // 保持兼容
+        tag_set_state(TAG_ST_WAIT_RESP);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    } else if (g_tag_refactored_ctx.state == TAG_ST_FINAL_TX) {
+        g_tag_refactored_ctx.tx3_real = ts;
+        tag_set_state(TAG_ST_WAIT_FACK);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    } else {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+}
+
+/* Tag回调：RX成功 */
+static void tag_on_rx_refactored(const dwt_cb_data_t *cb) {
+    uint8_t buf[127];
+    uint16_t len = cb->datalength;
+    if (len > sizeof(buf)) len = sizeof(buf);
+    dwt_readrxdata(buf, len, 0);
+
+    uwb_frame_view_t v;
+    if (uwb_parse_frame(buf, len, &v) != 0) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+    if (v.hdr->pan != g_pan_id) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    uint8_t type = uwb_get_msg_type(&v);
+
+    /* RESP */
+    if (type == UWB_MSG_RESP && g_tag_refactored_ctx.state == TAG_ST_WAIT_RESP) {
+        tag_handle_resp_refactored(&v);
+        return;
+    }
+
+    /* FACK */
+    if (type == UWB_MSG_FACK && g_tag_refactored_ctx.state == TAG_ST_WAIT_FACK) {
+        tag_handle_fack_refactored(&v);
+        return;
+    }
+
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Tag回调：RX超时 */
+static void tag_on_rx_to_refactored(const dwt_cb_data_t *cb) {
+    (void)cb;
+
+    if (g_tag_refactored_ctx.state == TAG_ST_WAIT_RESP) {
+        uart1_printf("[RESP-TO] anchor=%u", g_tag_refactored_ctx.target_anchor);
+        tag_advance_anchor();
+    } else if (g_tag_refactored_ctx.state == TAG_ST_WAIT_FACK) {
+        uart1_printf("[FACK-TO] anchor=%u", g_tag_refactored_ctx.target_anchor);
+        tag_advance_anchor();
+    } else {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+}
+
+/* Tag回调：RX错误 */
+static void tag_on_rx_err_refactored(const dwt_cb_data_t *cb) {
+    (void)cb;
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Tag周期任务 */
+static void tag_periodic_refactored(void) {
+    if (!s_tag_proactive_enabled) return;
+    uint32_t now = HAL_GetTick();
+
+    if (g_tag_refactored_ctx.state == TAG_ST_IDLE &&
+        (now - s_tag_last_poll_ms) >= s_tag_poll_interval_ms) {
+        s_tag_last_poll_ms = now;
+        tag_send_poll_refactored();
+    }
+}
+
+#endif /* USE_REFACTORED_TAG */
 
 /* 推进到下一个 Anchor（循环 1→5→1） */
 static inline void advance_to_next_anchor(void) {
@@ -958,7 +1311,21 @@ void tag_init(void) {
     tag_update_display();
     OLED_Update();
 
+#if USE_REFACTORED_TAG
+    // 使用重构后的回调
+    dwt_setcallbacks(tag_on_tx_refactored, tag_on_rx_refactored,
+                    tag_on_rx_to_refactored, tag_on_rx_err_refactored, NULL, NULL);
+
+    // 初始化重构上下文
+    memset(&g_tag_refactored_ctx, 0, sizeof(g_tag_refactored_ctx));
+    g_tag_refactored_ctx.state = TAG_ST_IDLE;
+#else
+    // 使用原始回调
     dwt_setcallbacks(tag_on_tx_done, tag_on_rx_ok, tag_on_rx_to, tag_on_rx_err, NULL, NULL);
+    s_phase = TAG_IDLE;
+    s_tx_busy = 0;
+#endif
+
     dwt_setinterrupt(
         DWT_INT_RFCG | DWT_INT_TFRS | DWT_INT_RFTO |
         DWT_INT_RFCE | DWT_INT_RPHE | DWT_INT_RFSL |
@@ -970,9 +1337,6 @@ void tag_init(void) {
 
     memset(g_anchors, 0, sizeof(g_anchors));
     g_last_tx_ms_tag = g_last_flush_ms_tag = HAL_GetTick();
-
-    s_phase = TAG_IDLE;
-    s_tx_busy = 0;
 
     // 预填若干 anchor（可选）
     for (uint16_t aid = 0x0001; aid <= 0x0005; ++aid) {
@@ -992,7 +1356,11 @@ static uint32_t s_last_oled_update_ms = 0;
 #define OLED_UPDATE_INTERVAL_MS 500  /* 每 500ms 更新一次 OLED */
 
 void tag_process(void) {
+#if USE_REFACTORED_TAG
+    tag_periodic_refactored();
+#else
     uwb_periodic_task();
+#endif
     log_flush();
     try_flush_json();
     dwt_isr();
@@ -1013,6 +1381,355 @@ void tag_process(void) {
 #define ANCHOR_SLOT_COUNT      (ANCHOR_ID_LAST - ANCHOR_ID_FIRST + 1) /* =5 */
 #define ANCHOR_REPLY_BASE_US    800U   // 槽0基准
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
+
+#if USE_REFACTORED_ANCHOR
+/* ============================================================
+ * Anchor侧重构：统一事务管理和事件处理
+ * ============================================================ */
+
+/* Anchor状态 */
+typedef enum {
+    ANCHOR_ST_IDLE = 0,      // 监听中
+    ANCHOR_ST_RESP_SCHED,    // RESP已调度
+    ANCHOR_ST_WAIT_FINAL,    // 等待FINAL
+    ANCHOR_ST_FACK_SCHED     // FACK已调度
+} anchor_state_e;
+
+/* Anchor交易上下文（每个Tag一个） */
+typedef struct {
+    uint8_t active;
+    anchor_state_e state;
+    uint32_t state_entry_ms;
+
+    uint16_t tag_id;
+    uint8_t expect_seq;
+
+    // 时间戳
+    uint64_t rx1;        // Anchor收到POLL
+    uint64_t tx2_plan;   // 计划发送RESP
+    uint64_t tx2_real;   // 实际发送RESP
+    uint64_t rx3;        // Anchor收到FINAL
+    uint64_t tx4_plan;   // 计划发送FACK
+
+    // Tag回传的时间戳（用于验证）
+    uint64_t tag_tx1;
+    uint64_t tag_rx2;
+    uint64_t tag_tx3;
+} anchor_txn_t;
+
+#define ANCHOR_MAX_CONCURRENT_TAGS 8
+static anchor_txn_t g_anchor_txn[ANCHOR_MAX_CONCURRENT_TAGS];
+
+/* 查找交易 */
+static anchor_txn_t *anchor_find_txn(uint16_t tag_id) {
+    for (int i = 0; i < ANCHOR_MAX_CONCURRENT_TAGS; i++) {
+        if (g_anchor_txn[i].active && g_anchor_txn[i].tag_id == tag_id) {
+            return &g_anchor_txn[i];
+        }
+    }
+    return NULL;
+}
+
+/* 分配交易 */
+static anchor_txn_t *anchor_alloc_txn(uint16_t tag_id) {
+    // 先查找现有
+    anchor_txn_t *txn = anchor_find_txn(tag_id);
+    if (txn) {
+        memset(txn, 0, sizeof(*txn));
+        txn->active = 1;
+        txn->tag_id = tag_id;
+        txn->state_entry_ms = HAL_GetTick();
+        return txn;
+    }
+
+    // 分配新的
+    for (int i = 0; i < ANCHOR_MAX_CONCURRENT_TAGS; i++) {
+        if (!g_anchor_txn[i].active) {
+            memset(&g_anchor_txn[i], 0, sizeof(g_anchor_txn[i]));
+            g_anchor_txn[i].active = 1;
+            g_anchor_txn[i].tag_id = tag_id;
+            g_anchor_txn[i].state_entry_ms = HAL_GetTick();
+            return &g_anchor_txn[i];
+        }
+    }
+    return NULL;
+}
+
+/* 释放交易 */
+static void anchor_free_txn(anchor_txn_t *txn) {
+    if (txn) {
+        txn->active = 0;
+    }
+}
+
+/* 垃圾回收（基于状态超时） */
+static void anchor_gc_txn(void) {
+    uint32_t now = HAL_GetTick();
+    for (int i = 0; i < ANCHOR_MAX_CONCURRENT_TAGS; i++) {
+        if (g_anchor_txn[i].active) {
+            uint32_t age_ms = now - g_anchor_txn[i].state_entry_ms;
+            uint32_t timeout_ms = 100;
+
+            // 根据状态设置不同超时
+            if (g_anchor_txn[i].state == ANCHOR_ST_WAIT_FINAL) {
+                timeout_ms = (FINAL_WINDOW_US / 1000) + 50;
+            }
+
+            if (age_ms > timeout_ms) {
+                uart1_printf("[GC] tag=%u state=%d age=%lums",
+                            g_anchor_txn[i].tag_id,
+                            g_anchor_txn[i].state,
+                            (unsigned long)age_ms);
+                anchor_free_txn(&g_anchor_txn[i]);
+            }
+        }
+    }
+}
+
+/* Anchor处理POLL */
+static void anchor_handle_poll_refactored(const uwb_frame_view_t *v) {
+    // 验证目标
+    if (!(v->hdr->dst == g_addr_short || v->hdr->dst == g_bcast)) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    // 速率节流
+    uint32_t now_ms = HAL_GetTick();
+    if ((now_ms - g_last_tx_ms_acr) < g_min_interval_ms_acr) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    // 分配交易
+    uint16_t tag_id = v->hdr->src;
+    anchor_txn_t *txn = anchor_alloc_txn(tag_id);
+    if (!txn) {
+        uart1_printf("[ERR] No free txn for tag=%u", tag_id);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    // 记录RX1
+    uint8_t rxts5[5];
+    dwt_readrxtimestamp(rxts5);
+    txn->rx1 = uwb_ts40_to_64(rxts5);
+    txn->expect_seq = (uint8_t)(v->hdr->seq + 2);
+
+    // 计算TX2
+    txn->tx2_plan = (txn->rx1 + US_TO_DTU(ANCHOR_REPLY_BASE_US)) & TS_MASK_40;
+    uint64_t tx2_air = (txn->tx2_plan + g_tx_ant_dly) & TS_MASK_40;
+
+    // 构建RESP
+    uint8_t txbuf[64];
+    uint16_t mac_len = uwb_build_resp(txbuf, (uint8_t)(v->hdr->seq + 1),
+                                     v->hdr->pan, tag_id, g_addr_short,
+                                     txn->rx1, tx2_air);
+
+    // 发送RESP
+    tx_cfg_t cfg = {
+        .delayed = 1,
+        .tx_time = txn->tx2_plan,
+        .retry_step = 0,
+        .max_retry = 0,
+        .rx_en = 1,
+        .rx_to = FINAL_WINDOW_US
+    };
+
+    if (unified_tx(txbuf, mac_len, &cfg) == 0) {
+        txn->state = ANCHOR_ST_RESP_SCHED;
+        txn->state_entry_ms = now_ms;
+        g_last_tx_ms_acr = now_ms;
+        s_anchor_rx_count++;
+        uart1_printf("[POLL] tag=%u seq=%u", tag_id, v->hdr->seq);
+    } else {
+        uart1_printf("[RESP-FAIL] tag=%u", tag_id);
+        anchor_free_txn(txn);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+}
+
+/* Anchor RESP TX完成 */
+static void anchor_on_resp_tx_done(anchor_txn_t *txn) {
+    // 读取实际TX2
+    uint8_t txts5[5];
+    dwt_readtxtimestamp(txts5);
+    txn->tx2_real = uwb_ts40_to_64(txts5);
+
+    // 自适应校准
+    uint64_t tx2_target = (txn->tx2_plan + g_tx_ant_dly) & TS_MASK_40;
+    int64_t err_dtu = (int64_t)((txn->tx2_real - tx2_target) & TS_MASK_40);
+    if (err_dtu > (1LL << 39)) err_dtu -= (1LL << 40);
+
+    __disable_irq();
+    g_dly_err_acc += (int32_t)err_dtu;
+    g_dly_samples++;
+
+    if (g_dly_samples >= DLY_CALIB_SAMPLES) {
+        int32_t avg_err = g_dly_err_acc / (int32_t)g_dly_samples;
+        int32_t adjust = avg_err / DLY_CALIB_GAIN;
+
+        uint64_t new_dly = g_tx_ant_dly + adjust;
+        if (new_dly < TX_ANT_DLY_MIN) new_dly = TX_ANT_DLY_MIN;
+        if (new_dly > TX_ANT_DLY_MAX) new_dly = TX_ANT_DLY_MAX;
+
+        uart1_printf("[DLY-CALIB] %lu->%lu err=%ld",
+                    (unsigned long)g_tx_ant_dly,
+                    (unsigned long)new_dly,
+                    (long)avg_err);
+
+        g_tx_ant_dly = new_dly;
+        g_dly_err_acc = 0;
+        g_dly_samples = 0;
+    }
+    __enable_irq();
+
+    // 转到等待FINAL
+    txn->state = ANCHOR_ST_WAIT_FINAL;
+    txn->state_entry_ms = HAL_GetTick();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Anchor处理FINAL */
+static void anchor_handle_final_refactored(const uwb_frame_view_t *v) {
+    // 查找交易
+    uint16_t tag_id = v->hdr->src;
+    anchor_txn_t *txn = anchor_find_txn(tag_id);
+    if (!txn || txn->state != ANCHOR_ST_WAIT_FINAL) {
+        uart1_printf("[FINAL-NOTXN] tag=%u", tag_id);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    // 解析负载
+    if (v->payload_len < sizeof(pl_final_t)) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    const pl_final_t *pf = (const pl_final_t *)v->payload;
+    txn->tag_tx1 = uwb_ts40_to_64(pf->t_tx1);
+    txn->tag_rx2 = uwb_ts40_to_64(pf->t_rx2);
+    txn->tag_tx3 = uwb_ts40_to_64(pf->t_tx3);
+
+    // 记录RX3
+    uint8_t rxts5[5];
+    dwt_readrxtimestamp(rxts5);
+    txn->rx3 = uwb_ts40_to_64(rxts5);
+
+    s_anchor_final_count++;
+
+    uart1_printf("[FINAL] tag=%u seq=%u", tag_id, v->hdr->seq);
+
+    // 核对延迟
+    int32_t plan_us = rel_us(txn->tx2_plan, txn->rx1);
+    int32_t real_us = rel_us(txn->tx2_real, txn->rx1);
+    uart1_printf("[RESP-CHK] plan=%ldus real=%ldus delta=%ldus",
+                (long)plan_us, (long)real_us, (long)(real_us - plan_us));
+
+    // 发送FACK
+    txn->tx4_plan = (txn->rx3 + US_TO_DTU(ACR_ACK_DELAY_US)) & TS_MASK_40;
+
+    uint8_t ack[48];
+    uint16_t ack_len = uwb_build_fack(ack, (uint8_t)(v->hdr->seq + 1),
+                                     g_pan_id, tag_id, g_addr_short,
+                                     txn->rx3);
+
+    // 发送配置（包含重试）
+    tx_cfg_t cfg = {
+        .delayed = 1,
+        .tx_time = txn->tx4_plan,
+        .delay_step = 200,  // 第1次重试+200us
+        .max_retry = 1,
+        .rx_en = 0,
+        .rx_to = 0
+    };
+
+    int ret = unified_tx(ack, ack_len, &cfg);
+    if (ret == 0) {
+        txn->state = ANCHOR_ST_FACK_SCHED;
+        uart1_printf("[FACK-OK] tag=%u", tag_id);
+    } else {
+        // 延迟失败，尝试立即发送
+        uart1_printf("[FACK-DELAY-FAIL] fallback to immediate");
+        cfg.delayed = 0;
+        cfg.max_retry = 0;
+        if (unified_tx(ack, ack_len, &cfg) == 0) {
+            uart1_printf("[FACK-IMM-OK] tag=%u", tag_id);
+        } else {
+            uart1_printf("[FACK-FAIL] tag=%u", tag_id);
+        }
+    }
+
+    // 清理交易
+    anchor_free_txn(txn);
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Anchor回调：TX完成 */
+static void anchor_on_tx_refactored(const dwt_cb_data_t *cb) {
+    (void)cb;
+
+    // 查找处于RESP_SCHED状态的交易
+    for (int i = 0; i < ANCHOR_MAX_CONCURRENT_TAGS; i++) {
+        if (g_anchor_txn[i].active && g_anchor_txn[i].state == ANCHOR_ST_RESP_SCHED) {
+            anchor_on_resp_tx_done(&g_anchor_txn[i]);
+            return;
+        }
+    }
+
+    // 没有找到，直接回到RX
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Anchor回调：RX成功 */
+static void anchor_on_rx_refactored(const dwt_cb_data_t *cb) {
+    uint8_t rxbuf[127];
+    uint16_t rxlen = cb->datalength;
+    if (rxlen > sizeof(rxbuf)) rxlen = sizeof(rxbuf);
+    dwt_readrxdata(rxbuf, rxlen, 0);
+
+    uwb_frame_view_t v;
+    if (uwb_parse_frame(rxbuf, rxlen, &v) != 0) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+    if (v.hdr->pan != g_pan_id) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
+    uint8_t type = uwb_get_msg_type(&v);
+
+    /* POLL */
+    if (type == UWB_MSG_POLL) {
+        anchor_handle_poll_refactored(&v);
+        return;
+    }
+
+    /* FINAL */
+    if (type == UWB_MSG_FINAL) {
+        anchor_handle_final_refactored(&v);
+        return;
+    }
+
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Anchor回调：RX超时 */
+static void anchor_on_rx_to_refactored(const dwt_cb_data_t *cb) {
+    (void)cb;
+    anchor_gc_txn();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Anchor回调：RX错误 */
+static void anchor_on_rx_err_refactored(const dwt_cb_data_t *cb) {
+    (void)cb;
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+#endif /* USE_REFACTORED_ANCHOR */
 
 /* Anchor 侧短地址与速率节流 */
 static uint16_t g_addr_short = 0x0000;
@@ -1385,7 +2102,19 @@ void anchor_init(void) {
     anchor_update_display();
     OLED_Update();
 
+#if USE_REFACTORED_ANCHOR
+    // 使用重构后的回调
+    dwt_setcallbacks(anchor_on_tx_refactored, anchor_on_rx_refactored,
+                    anchor_on_rx_to_refactored, anchor_on_rx_err_refactored, NULL, NULL);
+
+    // 初始化重构上下文
+    memset(g_anchor_txn, 0, sizeof(g_anchor_txn));
+#else
+    // 使用原始回调
     dwt_setcallbacks(anchor_on_tx_done, anchor_on_rx_ok, anchor_on_rx_to, anchor_on_rx_err, NULL, NULL);
+    memset(s_sess, 0, sizeof(s_sess));
+#endif
+
     dwt_setinterrupt(
         DWT_INT_RFCG | DWT_INT_TFRS | DWT_INT_RFTO |
         DWT_INT_RFCE | DWT_INT_RPHE | DWT_INT_RFSL |
@@ -1394,7 +2123,6 @@ void anchor_init(void) {
     dwt_setrxtimeout(0);
     (void) dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
-    memset(s_sess, 0, sizeof(s_sess));
     g_last_tx_ms_acr = HAL_GetTick();
 
     while (dwt_checkirq()) dwt_isr();
@@ -1402,7 +2130,11 @@ void anchor_init(void) {
 
 /* Anchor 定期更新 OLED */
 void anchor_process(void) {
+#if USE_REFACTORED_ANCHOR
+    anchor_gc_txn();
+#else
     gc_sessions();
+#endif
     dwt_isr();
 
     /* 定期更新 OLED */
