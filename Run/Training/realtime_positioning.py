@@ -6,6 +6,7 @@
 import os
 import sys
 import json
+import re
 import serial
 import serial.tools.list_ports
 import numpy as np
@@ -18,15 +19,24 @@ from enhanced_positioning_model import (
     EnhancedPositioningSystem
 )
 
+# ANSI转义字符正则表达式
+ANSI_RE = re.compile(r"\x1B\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_ansi(s: str) -> str:
+    """移除ANSI转义字符"""
+    return ANSI_RE.sub('', s)
+
 
 class RealtimePositioning:
     """实时定位系统"""
 
-    def __init__(self, model_path, anchor_positions=None):
+    def __init__(self, model_path, anchor_positions=None, debug=False):
         """
         参数:
             model_path: str, 模型文件路径
             anchor_positions: dict, 锚点坐标 {anchor_id: [x, y, z]}
+            debug: bool, 是否启用调试模式
         """
         # 加载模型
         print("加载距离校正模型...")
@@ -53,8 +63,15 @@ class RealtimePositioning:
         # 串口
         self.serial_port = None
 
+        # 调试模式
+        self.debug = debug
+
         # 统计
         self.total_updates = 0
+        self.total_lines = 0
+        self.json_errors = 0
+        self.role_mismatches = 0
+        self.insufficient_anchors = 0
         self.start_time = time.time()
 
     def find_serial_port(self):
@@ -200,59 +217,124 @@ class RealtimePositioning:
             return
 
         print("\n开始实时定位...")
+        if self.debug:
+            print("[调试模式已启用]")
         print("按 Ctrl+C 停止")
         print("-" * 60)
 
-        buffer = ""
-
         try:
             while True:
-                # 读取串口数据
-                if self.serial_port.in_waiting:
-                    chunk = self.serial_port.read(self.serial_port.in_waiting).decode('utf-8', errors='ignore')
-                    buffer += chunk
+                # 使用readline()逐行读取串口数据
+                line = self.serial_port.readline()
 
-                    # 按行处理
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        line = line.strip()
+                if not line:
+                    if self.debug:
+                        print("[DEBUG] 未接收到数据")
+                    continue
 
-                        if not line or not line.startswith('{'):
-                            continue
+                # 解码并移除ANSI转义字符
+                if isinstance(line, (bytes, bytearray)):
+                    line = line.decode('utf-8', errors='ignore')
 
-                        # 解析JSON
-                        measurements = self.parse_json_line(line)
+                original_line = line
+                line = strip_ansi(line.strip())
 
-                        if measurements and len(measurements) >= 3:
-                            # 估算位置
-                            result = self.positioning_system.estimate_position(measurements)
+                if self.debug and original_line != line.strip():
+                    print(f"[DEBUG] 移除了ANSI转义字符")
 
-                            if result['position'] is not None:
-                                self.total_updates += 1
+                # 跳过空行和非JSON行
+                if not line:
+                    if self.debug:
+                        print("[DEBUG] 跳过空行")
+                    continue
 
-                                # 保存历史
-                                self.position_history.append(result['position'])
-                                for aid, dist_data in result['distances'].items():
-                                    self.distance_history[aid].append(
-                                        dist_data['filtered_distance']
-                                    )
+                if not (line.startswith('{') and line.endswith('}')):
+                    if self.debug:
+                        print(f"[DEBUG] 跳过非JSON行: {line[:50]}...")
+                    continue
 
-                                # 打印信息
-                                pos = result['position']
-                                static_str = "静态" if result['is_static'] else "动态"
-                                vel = result['velocity']
+                self.total_lines += 1
 
+                if self.debug:
+                    print(f"\n[DEBUG] ========== 第 {self.total_lines} 行 ==========")
+                    print(f"[DEBUG] 接收到JSON: {line[:100]}...")
+
+                # 解析JSON
+                try:
+                    data = json.loads(line)
+
+                    if self.debug:
+                        print(f"[DEBUG] JSON解析成功")
+                        print(f"[DEBUG] role: {data.get('role')}")
+                        print(f"[DEBUG] anchor数量: {len(data.get('anchors', []))}")
+
+                    if data.get('role') != 'tag':
+                        self.role_mismatches += 1
+                        if self.debug:
+                            print(f"[DEBUG] 跳过: role不是'tag'")
+                        continue
+
+                    measurements = self.parse_json_line(line)
+
+                    if self.debug:
+                        if measurements:
+                            print(f"[DEBUG] 成功解析到 {len(measurements)} 个有效anchor测量:")
+                            for aid, meas in measurements.items():
+                                dist = meas['measured_distance']
+                                print(f"[DEBUG]   Anchor {aid}: {dist:.3f}m")
+                        else:
+                            print(f"[DEBUG] 没有有效的anchor测量数据")
+
+                    if measurements and len(measurements) >= 3:
+                        # 估算位置
+                        result = self.positioning_system.estimate_position(measurements)
+
+                        if result['position'] is not None:
+                            self.total_updates += 1
+
+                            # 保存历史
+                            self.position_history.append(result['position'])
+                            for aid, dist_data in result['distances'].items():
+                                self.distance_history[aid].append(
+                                    dist_data['filtered_distance']
+                                )
+
+                            # 打印信息
+                            pos = result['position']
+                            static_str = "静态" if result['is_static'] else "动态"
+                            vel = result['velocity']
+
+                            if self.debug:
+                                print(f"[DEBUG] 定位成功!")
+                                print(f"[DEBUG] 位置: X={pos[0]:.3f}, Y={pos[1]:.3f}, Z={pos[2]:.3f}")
+                                print(f"[DEBUG] 状态: {static_str}, 速度: {vel:.3f}m/s")
+                            else:
                                 print(f"\r[{self.total_updates:04d}] 位置: "
                                       f"X={pos[0]:6.3f}m Y={pos[1]:6.3f}m Z={pos[2]:6.3f}m | "
                                       f"{static_str} | 速度: {vel:.3f}m/s | "
                                       f"Anchors: {len(measurements)}   ",
                                       end='', flush=True)
 
-                                # 回调
-                                if callback:
-                                    callback(result)
+                            # 回调
+                            if callback:
+                                callback(result)
+                        else:
+                            if self.debug:
+                                print(f"[DEBUG] 定位失败: 无法计算位置")
+                    else:
+                        self.insufficient_anchors += 1
+                        if self.debug:
+                            anchor_count = len(measurements) if measurements else 0
+                            print(f"[DEBUG] 跳过: anchor数量不足 ({anchor_count} < 3)")
 
-                time.sleep(0.001)  # 小延时，避免CPU占用过高
+                except json.JSONDecodeError as e:
+                    self.json_errors += 1
+                    if self.debug:
+                        print(f"[DEBUG] JSON解析失败: {e}")
+                        print(f"[DEBUG] 原始数据: {line[:100]}...")
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] 处理异常: {e}")
 
         except KeyboardInterrupt:
             print("\n\n停止定位")
@@ -261,8 +343,12 @@ class RealtimePositioning:
             elapsed = time.time() - self.start_time
             print(f"\n统计信息:")
             print(f"  运行时间: {elapsed:.1f}秒")
-            print(f"  总更新次数: {self.total_updates}")
-            print(f"  平均更新率: {self.total_updates/elapsed:.2f} Hz")
+            print(f"  总接收行数: {self.total_lines}")
+            print(f"  成功定位次数: {self.total_updates}")
+            print(f"  平均更新率: {self.total_updates/elapsed:.2f} Hz" if elapsed > 0 else "  平均更新率: N/A")
+            print(f"  JSON解析错误: {self.json_errors}")
+            print(f"  role不匹配: {self.role_mismatches}")
+            print(f"  anchor数量不足: {self.insufficient_anchors}")
 
     def close(self):
         """关闭连接"""
@@ -378,8 +464,11 @@ def main():
 
     print("\n提示: 如需修改锚点坐标，请编辑本文件中的 anchor_positions 字典")
 
+    # 询问是否启用调试模式
+    use_debug = input("\n是否启用调试模式? (y/n): ").lower().strip() == 'y'
+
     # 创建定位系统
-    positioning = RealtimePositioning(model_path, anchor_positions)
+    positioning = RealtimePositioning(model_path, anchor_positions, debug=use_debug)
 
     # 连接串口
     if not positioning.connect_serial():
