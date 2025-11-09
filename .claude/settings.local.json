@@ -21,7 +21,8 @@
       "Bash(\"D:\\Sync\\Syncthing\\Bucket\\Study\\USYD\\USYD_ELEC5308_UWB\\.venv\\Scripts\\python.exe\":*)",
       "Bash(tree:*)",
       "Bash(pip install:*)",
-      "Bash(move:*)"
+      "Bash(move:*)",
+      "Bash(dir /B /A:*)"
     ],
     "deny": [],
     "ask": []
