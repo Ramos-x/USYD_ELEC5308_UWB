@@ -1,0 +1,35 @@
+# UWB定位系统配置文件
+
+# 串口配置
+serial:
+  baudrate: 2000000
+  timeout: 0.2
+  target_device: "USB-SERIAL CH340"
+
+# 数据处理配置
+processing:
+  median_window: 5
+  ema_alpha: 0.3
+  outlier_threshold: 3.0
+  noise_window: 10
+
+# 机器学习模型配置
+model:
+  max_depth: 10
+  n_estimators: 200
+  learning_rate: 0.05
+  min_samples_split: 5
+  min_samples_leaf: 2
+
+# 卡尔曼滤波配置
+kalman:
+  process_variance: 0.01
+  measurement_variance: 0.1
+  static_threshold: 0.05
+  motion_window: 5
+
+# 定位配置
+localization:
+  min_anchors: 4
+  max_iterations: 100
+  convergence_threshold: 0.001

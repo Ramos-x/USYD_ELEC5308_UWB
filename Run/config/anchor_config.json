@@ -1,0 +1,47 @@
+{
+  "anchors": {
+    "1": {
+      "x": 0.3,
+      "y": 0.3,
+      "z": 0.6,
+      "name": "Anchor 1",
+      "description": "第一个锚点"
+    },
+    "2": {
+      "x": 3.3,
+      "y": 0.3,
+      "z": 1.82,
+      "name": "Anchor 2",
+      "description": "第二个锚点"
+    },
+    "3": {
+      "x": 3.3,
+      "y": 3.3,
+      "z": 0.6,
+      "name": "Anchor 3",
+      "description": "第三个锚点"
+    },
+    "4": {
+      "x": 0.3,
+      "y": 3.3,
+      "z": 1.82,
+      "name": "Anchor 4",
+      "description": "第四个锚点"
+    },
+    "5": {
+      "x": 1.8,
+      "y": 1.8,
+      "z": 2.85,
+      "name": "Anchor 5",
+      "description": "第五个锚点"
+    }
+  },
+  "input_anchors": [1, 2, 3, 4, 5],
+  "output_anchors": [1, 2, 3, 4, 5],
+  "min_anchors_for_3d": 4,
+  "position_bounds": {
+    "x": [-1.0, 5.0],
+    "y": [-1.0, 5.0],
+    "z": [-1.0, 3.5]
+  }
+}

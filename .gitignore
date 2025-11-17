@@ -1,1 +1,32 @@
 .idea/
+
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 日志文件
+logs/
+*.log
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 模型文件（可选）
+*.pkl
+*.h5
+*.joblib

@@ -773,50 +773,51 @@ def main():
                 # 检查是否有新数据（通过 seq 判断）
                 has_new_data = False
 
-              current_ranges_for_loc = {}
-              items = sorted(anchors_copy.items(), key=lambda kv: kv[0])
-              for aid, info in items:
-                seq = info.get('seq')
-                if isinstance(seq, int):
-                  if aid not in last_output_seq or last_output_seq[aid] != seq:
-                    has_new_data = True
-                    last_output_seq[aid] = seq
+                current_ranges_for_loc = {}
+                items = sorted(anchors_copy.items(), key=lambda kv: kv[0])
+                for aid, info in items:
+                    seq = info.get('seq')
+                    if isinstance(seq, int):
+                        if aid not in last_output_seq or last_output_seq[aid] != seq:
+                            has_new_data = True
+                            last_output_seq[aid] = seq
 
-                  d_raw = float(info.get('dist_m', float('nan'))
-                  if not (d_raw == d_raw): continue
+                        d_raw = float(info.get('dist_m', float('nan')))
+                        if not (d_raw == d_raw):
+                            continue
 
-                  b_manual = MANUAL_BIAS_PER_ANCHOR_M.get(aid, 0.0)
-                  s_manual = MANUAL_SCALE_PER_ANCHOR.get(aid, 1.0)
-                  d_corr = (d_raw - b_manual)* s_manual
-                  d_corr = max(0.0, d_corr)
+                        b_manual = MANUAL_BIAS_PER_ANCHOR_M.get(aid, 0.0)
+                        s_manual = MANUAL_SCALE_PER_ANCHOR.get(aid, 1.0)
+                        d_corr = (d_raw - b_manual) * s_manual
+                        d_corr = max(0.0, d_corr)
 
-                  if aid not in preprocessors:
-                    preprocessors[aid] = LinkPreprocessor()
+                        if aid not in preprocessors:
+                            preprocessors[aid] = LinkPreprocessor()
 
-                  d_filtered, noise_sigma = preprocessors[aid].process(d_corr)
-                  current_ranges_for_loc[aid] = (d_filtered, noise_sigma)
+                        d_filtered, noise_sigma = preprocessors[aid].process(d_corr)
+                        current_ranges_for_loc[aid] = (d_filtered, noise_sigma)
+
                 # 只有在有新数据时才输出
                 if has_new_data:
+                    X, Y, Z, R_err = None, None, None, None
 
-                  X, Y, Z, R_err = None, None, None, None
+                    if len(current_ranges_for_loc) >= MIN_ANCHORS_FOR_3D:
+                        X, Y, Z, R_err = multilaterate_3d(current_ranges_for_loc)
 
-                  if len(current_ranges_for_loc) >= MIN_ANCHORS_FOR_3D:
-                    X, Y, Z, R_err = multilaterate_3d(current_ranges_for_loc)
+                    parts = []
 
-                  parts = []
+                    if X is not None:
+                        pos_str = f"POS:({X:.2f}, {Y:.2f}, {Z:.2f})m, RangeRadius:{R_err:.2f}m"
+                        parts.append(pos_str)
+                    else:
+                        parts.append(f"POS: No solution (Need {MIN_ANCHORS_FOR_3D}+ Anchors)")
 
-                  if X is not None: 
-                    pos_str = f"POS:({X:.2f}, {Y:.2f}, {Z:.2f})m, RangeRadius:{R_err:.2f}m"
-                    parts.append(pos_str)
-                  else:
-                    parts.append(f"POS: No solution (Need {MIN_ANCHORS_FOR_3D}+ Anchors)")
-
-                  for aid, (d_filtered, noise_sigma) in current_ranges_for_loc.items():
-                    parts.append(f"A{aid}:{d_filtered:.3f}(σ{noise_sigma*1000:.0f}mm)")
+                    for aid, (d_filtered, noise_sigma) in current_ranges_for_loc.items():
+                        parts.append(f"A{aid}:{d_filtered:.3f}(σ{noise_sigma*1000:.0f}mm)")
 
                     if parts:
                         print(' '.join(parts))
-                      
+
                     time.sleep(0.01)
 
 

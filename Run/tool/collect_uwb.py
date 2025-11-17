@@ -101,32 +101,35 @@ def main():
     src = open_input(args)
 
     import csv
-    fout = open(args.out, 'w', newline='', encoding='utf-8')
-    fieldnames = [
-        'time_ms','role','tag','aid','seq','complete',
-        'dt_tx1_rx2','dt_rx2_tx3p','dt_rx2_tx3r',
-        'qual_cia','qual_xo','ipatov_peak','ipatov_pwr','ipatov_fp_idx','ipatov_acc'
-    ]
-    w = csv.DictWriter(fout, fieldnames=fieldnames)
-    w.writeheader()
+    try:
+        with open(args.out, 'w', newline='', encoding='utf-8') as fout:
+            fieldnames = [
+                'time_ms','role','tag','aid','seq','complete',
+                'dt_tx1_rx2','dt_rx2_tx3p','dt_rx2_tx3r',
+                'qual_cia','qual_xo','ipatov_peak','ipatov_pwr','ipatov_fp_idx','ipatov_acc'
+            ]
+            w = csv.DictWriter(fout, fieldnames=fieldnames)
+            w.writeheader()
 
-    for line in iter_lines(src):
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith('{') and line.endswith('}'):  # 粗略过滤
-            try:
-                js = json.loads(line)
-            except Exception:
-                continue
-            if js.get('role') != 'tag':
-                continue
-            rows = flatten_record(js)
-            for r in rows:
-                w.writerow(r)
-                fout.flush()
-
-    fout.close()
+            for line in iter_lines(src):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('{') and line.endswith('}'):  # 粗略过滤
+                    try:
+                        js = json.loads(line)
+                    except Exception:
+                        continue
+                    if js.get('role') != 'tag':
+                        continue
+                    rows = flatten_record(js)
+                    for r in rows:
+                        w.writerow(r)
+                        fout.flush()
+    finally:
+        # 确保关闭输入源（除了stdin）
+        if hasattr(src, 'close') and src != sys.stdin:
+            src.close()
 
 
 if __name__ == '__main__':

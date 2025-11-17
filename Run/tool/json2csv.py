@@ -292,43 +292,44 @@ def main():
     # 打开输入
     src, is_serial = open_input(args)
 
-    # 打开输出
-    fout = open(args.out, 'w', newline='', encoding='utf-8')
-    w = csv.writer(fout, delimiter=args.delimiter)
-
-    # 写表头：对每个 anchor 输出 d,peak,pwr,fp_idx,acc,xo
-    header: List[str] = []
-    for aid in (1, 2, 3, 4, 5):
-        prefix = f'a{aid}'
-        header.extend([f'{prefix}_m', f'{prefix}_peak', f'{prefix}_pwr', f'{prefix}_fp_idx', f'{prefix}_acc', f'{prefix}_xo'])
-    w.writerow(header)
-
-    # 最大收集条数（仅统计成功写入的记录）
-    max_rows = getattr(args, 'count', None)
-    written = 0
-
-    for line in iter_lines(src, is_serial):
-        if not (line.startswith('{') and line.endswith('}')):
-            continue
-        try:
-            js = json.loads(line)
-        except Exception:
-            continue
-        row = process_record(js)
-        if row is not None:
-            w.writerow(row)
-            fout.flush()
-            written += 1
-            if max_rows is not None and written >= max_rows:
-                print(f"已收集 {written} 条，停止。")
-                break
-
-    fout.close()
     try:
-        if hasattr(src, 'close'):
-            src.close()
-    except Exception:
-        pass
+        # 打开输出
+        with open(args.out, 'w', newline='', encoding='utf-8') as fout:
+            w = csv.writer(fout, delimiter=args.delimiter)
+
+            # 写表头：对每个 anchor 输出 d,peak,pwr,fp_idx,acc,xo
+            header: List[str] = []
+            for aid in (1, 2, 3, 4, 5):
+                prefix = f'a{aid}'
+                header.extend([f'{prefix}_m', f'{prefix}_peak', f'{prefix}_pwr', f'{prefix}_fp_idx', f'{prefix}_acc', f'{prefix}_xo'])
+            w.writerow(header)
+
+            # 最大收集条数（仅统计成功写入的记录）
+            max_rows = getattr(args, 'count', None)
+            written = 0
+
+            for line in iter_lines(src, is_serial):
+                if not (line.startswith('{') and line.endswith('}')):
+                    continue
+                try:
+                    js = json.loads(line)
+                except Exception:
+                    continue
+                row = process_record(js)
+                if row is not None:
+                    w.writerow(row)
+                    fout.flush()
+                    written += 1
+                    if max_rows is not None and written >= max_rows:
+                        print(f"已收集 {written} 条，停止。")
+                        break
+    finally:
+        # 确保关闭输入源（除了stdin）
+        if hasattr(src, 'close') and src != sys.stdin:
+            try:
+                src.close()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

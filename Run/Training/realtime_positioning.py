@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from collections import deque
 import time
+import traceback
 from datetime import datetime
 from enhanced_positioning_model import (
     DistanceCorrectionModel,
@@ -166,7 +167,6 @@ class RealtimePositioning:
             # 总是打印CSV写入错误，帮助调试
             print(f"\n警告: CSV写入错误: {e}")
             if self.debug:
-                import traceback
                 traceback.print_exc()
 
     def find_serial_port(self):
@@ -335,7 +335,6 @@ class RealtimePositioning:
             return None
         except Exception as e:
             if self.debug:
-                import traceback
                 print(f"[DEBUG] 解析异常: {e}")
                 print(f"[DEBUG] 堆栈跟踪:")
                 traceback.print_exc()
