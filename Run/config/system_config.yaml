@@ -1,10 +1,13 @@
 # UWB定位系统配置文件
+# 此文件包含串口、处理、定位算法和日志等系统级配置
 
 # 串口配置
 serial:
-  baudrate: 2000000
-  timeout: 0.2
-  target_device: "USB-SERIAL CH340"
+  baud: 2000000                    # 波特率
+  baudrate: 2000000                # 向后兼容
+  timeout: 0.2                     # 读超时(秒)
+  device_name: "USB-SERIAL CH340"  # 设备名称
+  target_device: "USB-SERIAL CH340"  # 向后兼容
 
 # 数据处理配置
 processing:
@@ -33,3 +36,29 @@ localization:
   min_anchors: 4
   max_iterations: 100
   convergence_threshold: 0.001
+
+# 定位算法配置（新增）
+positioning:
+  max_iterations: 20              # 最大迭代次数
+  convergence_threshold: 0.001    # 收敛阈值(米)
+  initial_step: 0.5               # 初始步长(米)
+  use_adaptive_step: true         # 是否使用自适应步长
+  min_step: 0.001                 # 最小步长(米)
+
+# 日志配置（新增）
+logging:
+  level: "INFO"          # 日志级别: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_output: true   # 是否输出到控制台
+  file_output: true      # 是否输出到文件
+  max_file_size_mb: 10   # 单个日志文件最大大小(MB)
+  backup_count: 5        # 保留的备份日志文件数量
+
+# 性能优化配置（新增）
+performance:
+  use_fast_json: false   # 是否使用ujson/orjson（需要安装）
+  buffer_size: 1024      # 缓冲区大小
+
+# 可视化配置（新增）
+visualization:
+  update_interval_ms: 100  # 更新间隔(毫秒)
+  history_points: 100      # 历史轨迹点数
