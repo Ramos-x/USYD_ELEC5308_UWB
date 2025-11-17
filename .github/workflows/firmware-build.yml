@@ -23,13 +23,21 @@ jobs:
     - name: Cache ARM toolchain
       uses: actions/cache@v3
       with:
-        path: ~/arm-toolchain
-        key: ${{ runner.os }}-arm-gcc-10.3
+        path: ~/gcc-arm-none-eabi-10.3-2021.10
+        key: ${{ runner.os }}-arm-gcc-10.3-2021.10
 
     - name: Install ARM GCC toolchain
       run: |
-        wget -q https://developer.arm.com/-/media/Files/downloads/gnu-rm/10.3-2021.10/gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2
-        tar -xjf gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2 -C ~
+        # 检查缓存是否存在
+        if [ ! -d "$HOME/gcc-arm-none-eabi-10.3-2021.10" ]; then
+          echo "下载ARM GCC工具链..."
+          wget -q https://developer.arm.com/-/media/Files/downloads/gnu-rm/10.3-2021.10/gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2 || \
+          wget -q https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu-rm/10.3-2021.10/gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2
+          tar -xjf gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2 -C ~
+          rm gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2
+        else
+          echo "使用缓存的ARM GCC工具链"
+        fi
         echo "$HOME/gcc-arm-none-eabi-10.3-2021.10/bin" >> $GITHUB_PATH
 
     - name: Verify toolchain installation
