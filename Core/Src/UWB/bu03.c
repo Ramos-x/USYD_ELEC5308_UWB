@@ -8,6 +8,7 @@
 #include "uwb.h"
 #include "deca_device_api.h"
 #include "bu03.h"
+#include "uwb_protocol_config.h"  /* 统一协议配置 */
 
 extern void dwt_readsystime(uint8_t *timestamp);
 
@@ -18,7 +19,7 @@ extern void dwt_readsystime(uint8_t *timestamp);
 /* ================ UART1 环形缓冲 + DMA ================ */
 extern UART_HandleTypeDef huart1;
 
-#define UART1_TX_BUF_SZ  2048
+/* 使用协议配置文件中的定义 */
 static uint8_t uart1_tx_buf[UART1_TX_BUF_SZ];
 static volatile uint16_t tx_head = 0; // 写指针
 static volatile uint16_t tx_tail = 0; // 读指针
@@ -226,12 +227,9 @@ static uint16_t g_pan_id = 0xABCD;
 static const uint16_t g_bcast = 0xFFFF;
 
 /* ======================= TAG 部分 ======================= */
-#define FINAL_DELAY_US   1500U
-#define FINAL_CHAIN_GAP_US    600U //final 重排延迟（增大以避免延迟启动失败）
-#define RESP_WINDOW_US       6000U  //当前 800+4*1000
-#define ACK_WINDOW_US   6000U      /* FINAL 后等待 FACK 的窗口 */
-#define FINAL_DELAY_DTU  ((uint64_t)((FINAL_DELAY_US*1e-6)/DWT_TIME_UNITS + 0.5))
-#define FINAL_CHAIN_GAP_DTU US_TO_DTU(FINAL_CHAIN_GAP_US)
+/* 协议时序参数现在从uwb_protocol_config.h统一配置 */
+#define FINAL_DELAY_DTU      ((uint64_t)((TAG_FINAL_DELAY_US*1e-6)/DWT_TIME_UNITS + 0.5))
+#define FINAL_CHAIN_GAP_DTU  US_TO_DTU(FINAL_CHAIN_GAP_US)
 /* 会话过期阈值：从 rx2 到现在超过该时间则判定会话过期（单位us） */
 #ifndef FINAL_SESSION_MAX_AGE_US
 #define FINAL_SESSION_MAX_AGE_US 3000U
@@ -260,9 +258,12 @@ typedef struct {
     uint64_t t1, t2;
 } log_evt_t;
 
-#define LOG_CAP 32
+#define LOG_CAP LOG_QUEUE_CAPACITY  /* 使用协议配置 */
 static volatile uint8_t s_log_head = 0, s_log_tail = 0;
 static log_evt_t s_log_q[LOG_CAP];
+
+/* JSON输出缓冲区（静态分配以避免栈溢出） */
+static char s_json_output_buffer[JSON_OUTPUT_BUF_SIZE];
 
 static inline int log_push(const log_evt_t *e) {
     __disable_irq();
@@ -1132,9 +1133,11 @@ static void try_flush_json(void) {
         return;
     }
 
-    char out[2048];
+    /* 使用静态缓冲区以避免栈溢出 */
+    char *out = s_json_output_buffer;
+    const size_t out_size = JSON_OUTPUT_BUF_SIZE;
     size_t pos = 0;
-    int n = snprintf(out + pos, sizeof(out) - pos,
+    int n = snprintf(out + pos, out_size - pos,
                      "{\"role\":\"tag\",\"tag\":\"0x%04X\",\"tick\":%lu,\"anchor_count\":%d,\"anchors\":[",
                      (unsigned) g_tag_short, (unsigned long) now, total);
     if (n <= 0) { return; }
@@ -1183,7 +1186,7 @@ static void try_flush_json(void) {
                                   : 0;
 
         /* ★ 输出 JSON：在每个 anchor 下新增 ex{} 与 dt_us{} */
-        n = snprintf(out + pos, sizeof(out) - pos,
+        n = snprintf(out + pos, out_size - pos,
                      "%s{\"aid\":%u,\"aid_hex\":\"%04X\",\"tick\":%lu,"
                      // "\"dist_mm\":%ld,"
                      "\"ts\":\"%s\","  /* 兼容旧字段：仍表示 rx2 的 5B */
@@ -1210,14 +1213,14 @@ static void try_flush_json(void) {
 
 
         if (n <= 0) break;
-        if ((size_t) n >= (sizeof(out) - pos - 2)) break;
+        if ((size_t) n >= (out_size - pos - 2)) break;
         pos += (size_t) n;
         first = 0;
     }
 
-    if (pos < sizeof(out)) out[pos++] = ']';
-    if (pos < sizeof(out)) out[pos++] = '}';
-    out[(pos < sizeof(out)) ? pos : (sizeof(out) - 1)] = '\0';
+    if (pos < out_size) out[pos++] = ']';
+    if (pos < out_size) out[pos++] = '}';
+    out[(pos < out_size) ? pos : (out_size - 1)] = '\0';
 
     uart1_write_bytes((const uint8_t *) out, (uint16_t) strlen(out));
     static const uint8_t crlf[2] = {'\r', '\n'};

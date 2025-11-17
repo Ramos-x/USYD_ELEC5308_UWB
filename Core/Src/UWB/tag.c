@@ -6,6 +6,7 @@
 #include "deca_device_api.h"
 #include "bu03.h"
 #include "tag.h"
+#include "uwb_protocol_config.h"  /* 统一协议配置 */
 
 #include "anchor.h"
 #include "app.h"
@@ -18,7 +19,6 @@
 extern UART_HandleTypeDef huart1;
 
 /* ===== UART1 TX 环形缓冲 + DMA 状态 ===== */
-#define UART1_TX_BUF_SZ  2048  // 可按需要调整为 512/1024/4096 等
 static uint8_t uart1_tx_buf[UART1_TX_BUF_SZ];
 static volatile uint16_t tx_head = 0; // 写指针
 static volatile uint16_t tx_tail = 0; // 读指针(下次DMA从这里取)
@@ -31,8 +31,7 @@ static volatile uint8_t dma_busy = 0; // 1=DMA正在发送
 #endif
 
 /* Tag 发送 FINAL 的延迟（相对收到 RESP 的时刻），保证足够的处理裕量 */
-//2000 µs 很保守、稳定。后续可按空口负载缩短到几百微秒，但要确保 ≥ DW 芯片要求的最小延迟（几十微秒量级）且预留处理时间。
-#define TAG_FINAL_DELAY_US   2000U
+/* 现在使用uwb_protocol_config.h中的统一配置 */
 #define FINAL_DELAY_DTU ((uint64_t)((TAG_FINAL_DELAY_US * 1e-6) / DWT_TIME_UNITS + 0.5))
 
 #ifndef SPEED_OF_LIGHT

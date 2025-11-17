@@ -7,6 +7,7 @@
 #include "bu03.h"
 #include "app.h"
 #include "anchor.h"
+#include "uwb_protocol_config.h"  /* 统一协议配置 */
 
 #include "uwb_frames.h"
 #include "OLED/oled.h"
@@ -23,10 +24,8 @@
 #define ANCHOR_REPLY_BASE_US    2500U   // 槽0 相对 POLL 的基准延迟
 #define ANCHOR_SLOT_SPACING_US  2000U   // 槽间隔
 
-
 /* Tag 会在收到 RESP ~2ms 后发 FINAL，Anchor 侧监听窗口要覆盖它 */
-#define TAG_FINAL_DELAY_US      2000U   /* 与 Tag 侧保持一致 */
-#define FINAL_CHAIN_GAP_US      800U    /* Tag 串行发 FINAL 的最小间隔（信息） */
+/* 现在使用uwb_protocol_config.h中的统一配置 TAG_FINAL_DELAY_US 和 FINAL_CHAIN_GAP_US */
 
 /* Anchor 侧 FINAL 监听窗，足以覆盖 2ms 基准 + 稍许裕量即可
    因为我们让时隙间隔 (2000us) > FINAL_CHAIN_GAP_US (800us)，
@@ -36,7 +35,7 @@
 #endif
 
 /* ===== UART1 TX 环形缓冲 + DMA 状态 ===== */
-#define UART1_TX_BUF_SZ  2048  // 可按需要调整为 512/1024/4096 等
+/* 使用协议配置文件中的定义 */
 static uint8_t uart1_tx_buf[UART1_TX_BUF_SZ];
 static volatile uint16_t tx_head = 0; // 写指针
 static volatile uint16_t tx_tail = 0; // 读指针(下次DMA从这里取)
@@ -158,7 +157,10 @@ static void ts40_to_hex(char out[11], uint64_t ts40) {
     // 40bit 小端->HEX（高位在前）
     uint8_t b[5];
     for (int i = 0; i < 5; ++i) b[i] = (uint8_t) ((ts40 >> (8 * i)) & 0xFF);
-    for (int i = 0; i < 5; ++i) sprintf(out + 2 * i, "%02X", b[4 - i]);
+    // 使用snprintf防止缓冲区溢出
+    for (int i = 0; i < 5; ++i) {
+        snprintf(out + 2 * i, 3, "%02X", b[4 - i]);
+    }
     out[10] = '\0';
 }
 
