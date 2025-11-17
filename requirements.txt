@@ -1,0 +1,20 @@
+# USYD_ELEC5308_UWB - Python依赖项
+# UWB定位系统所需的Python包
+
+# 核心依赖
+pyserial>=3.5          # 串口通信
+numpy>=1.20.0          # 数值计算
+pandas>=1.3.0          # 数据处理
+scikit-learn>=1.0.0    # 机器学习
+matplotlib>=3.4.0      # 可视化
+pyyaml>=5.4.0          # YAML配置文件支持
+
+# 数据处理
+joblib>=1.1.0          # 模型序列化
+
+# 可选依赖（用于文档和开发）
+markdown2>=2.4.0       # Markdown处理
+
+# 性能优化（可选）
+# ujson>=5.0.0         # 更快的JSON解析
+# orjson>=3.6.0        # 更快的JSON解析（Rust实现）
