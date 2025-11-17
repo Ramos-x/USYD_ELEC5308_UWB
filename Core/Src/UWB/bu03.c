@@ -636,8 +636,8 @@ static void tag_handle_resp_refactored(const uwb_frame_view_t *v) {
 
     // 提取时间戳
     const pl_resp_t *pr = (const pl_resp_t*)v->payload;
-    g_tag_refactored_ctx.rx1_an = uwb_ts40_to_64(pr->t_rx1);
-    g_tag_refactored_ctx.tx2_an = uwb_ts40_to_64(pr->t_rx2);
+    g_tag_refactored_ctx.rx1_an = uwb_ts40_to_64(pr->t_rx1);  // Anchor的RX1
+    g_tag_refactored_ctx.tx2_an = uwb_ts40_to_64(pr->t_tx2);  // 修复：应该是Anchor的TX2而非RX2
 
     uint8_t rxts5[5];
     dwt_readrxtimestamp(rxts5);
@@ -757,14 +757,29 @@ static void tag_on_rx_refactored(const dwt_cb_data_t *cb) {
 static void tag_on_rx_to_refactored(const dwt_cb_data_t *cb) {
     (void)cb;
 
-    if (g_tag_refactored_ctx.state == TAG_ST_WAIT_RESP) {
-        uart1_printf("[RESP-TO] anchor=%u", g_tag_refactored_ctx.target_anchor);
-        tag_advance_anchor();
-    } else if (g_tag_refactored_ctx.state == TAG_ST_WAIT_FACK) {
-        uart1_printf("[FACK-TO] anchor=%u", g_tag_refactored_ctx.target_anchor);
-        tag_advance_anchor();
-    } else {
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    switch (g_tag_refactored_ctx.state) {
+        case TAG_ST_WAIT_RESP:
+            uart1_printf("[RESP-TO] anchor=%u", g_tag_refactored_ctx.target_anchor);
+            tag_advance_anchor();
+            break;
+
+        case TAG_ST_WAIT_FACK:
+            uart1_printf("[FACK-TO] anchor=%u", g_tag_refactored_ctx.target_anchor);
+            tag_advance_anchor();
+            break;
+
+        case TAG_ST_IDLE:
+        case TAG_ST_POLL_TX:
+        case TAG_ST_FINAL_TX:
+            // 这些状态下不应该收到RX超时，记录异常并重新启动接收
+            uart1_printf("[RX-TO-UNEXPECTED] state=%d", g_tag_refactored_ctx.state);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            break;
+
+        default:
+            uart1_printf("[RX-TO-UNKNOWN] state=%d", g_tag_refactored_ctx.state);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            break;
     }
 }
 
@@ -1382,7 +1397,8 @@ void tag_process(void) {
 #define ANCHOR_ID_FIRST         0x0001
 #define ANCHOR_ID_LAST          0x0005
 #define ANCHOR_SLOT_COUNT      (ANCHOR_ID_LAST - ANCHOR_ID_FIRST + 1) /* =5 */
-#define ANCHOR_REPLY_BASE_US    800U   // 槽0基准
+/* 使用协议配置文件中的统一参数 */
+#define ANCHOR_REPLY_BASE_US    ANCHOR_RESP_DELAY_US  // 使用统一配置
 #define FINAL_WINDOW_US         4000U   // 等 FINAL 的窗口，覆盖 TAG_FINAL_DELAY_US
 
 #if USE_REFACTORED_ANCHOR
@@ -1471,11 +1487,29 @@ static void anchor_gc_txn(void) {
     for (int i = 0; i < ANCHOR_MAX_CONCURRENT_TAGS; i++) {
         if (g_anchor_txn[i].active) {
             uint32_t age_ms = now - g_anchor_txn[i].state_entry_ms;
-            uint32_t timeout_ms = 100;
+            uint32_t timeout_ms;
 
             // 根据状态设置不同超时
-            if (g_anchor_txn[i].state == ANCHOR_ST_WAIT_FINAL) {
-                timeout_ms = (FINAL_WINDOW_US / 1000) + 50;
+            switch (g_anchor_txn[i].state) {
+                case ANCHOR_ST_IDLE:
+                    timeout_ms = 10;  // IDLE状态快速清理
+                    break;
+
+                case ANCHOR_ST_RESP_SCHED:
+                    timeout_ms = 50;  // 发送RESP的调度窗口
+                    break;
+
+                case ANCHOR_ST_WAIT_FINAL:
+                    timeout_ms = (RESP_WINDOW_US / 1000) + 100;  // 等待FINAL的超时
+                    break;
+
+                case ANCHOR_ST_FACK_SCHED:
+                    timeout_ms = 50;  // 发送FACK的调度窗口
+                    break;
+
+                default:
+                    timeout_ms = 100;  // 未知状态使用默认超时
+                    break;
             }
 
             if (age_ms > timeout_ms) {
@@ -1638,12 +1672,12 @@ static void anchor_handle_final_refactored(const uwb_frame_view_t *v) {
                                      g_pan_id, tag_id, g_addr_short,
                                      txn->rx3);
 
-    // 发送配置（包含重试）
+    // 发送配置（包含重试）- 与Tag FINAL保持对称
     tx_cfg_t cfg = {
         .delayed = 1,
         .tx_time = txn->tx4_plan,
-        .delay_step = 200,  // 第1次重试+200us
-        .max_retry = 1,
+        .retry_step = FINAL_CHAIN_GAP_US,  // 修复字段名并统一重试间隔
+        .max_retry = 2,                     // 统一为2次重试
         .rx_en = 0,
         .rx_to = 0
     };
@@ -1791,7 +1825,8 @@ static inline uint64_t plan_tx2_from_rx1(uint64_t t_rx1) {
     return (t_rx1 + US_TO_DTU(off_us)) & TS_MASK_40;
 }
 
-#define ACR_ACK_DELAY_US 1500U
+/* ACK延迟应与FINAL延迟类似，使用统一配置 */
+#define ACR_ACK_DELAY_US TAG_FINAL_DELAY_US  // 使用统一配置
 static volatile uint8_t s_sending_resp = 0;
 static volatile uint16_t s_resp_tag_pending = 0;
 
