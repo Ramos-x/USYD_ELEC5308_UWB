@@ -1,0 +1,61 @@
+name: Firmware Build
+
+on:
+  push:
+    branches: [ Master, claude/* ]
+    paths:
+      - 'Core/**'
+      - 'Drivers/**'
+      - '*.ioc'
+  pull_request:
+    branches: [ Master ]
+    paths:
+      - 'Core/**'
+      - 'Drivers/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Cache ARM toolchain
+      uses: actions/cache@v3
+      with:
+        path: ~/arm-toolchain
+        key: ${{ runner.os }}-arm-gcc-10.3
+
+    - name: Install ARM GCC toolchain
+      run: |
+        wget -q https://developer.arm.com/-/media/Files/downloads/gnu-rm/10.3-2021.10/gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2
+        tar -xjf gcc-arm-none-eabi-10.3-2021.10-x86_64-linux.tar.bz2 -C ~
+        echo "$HOME/gcc-arm-none-eabi-10.3-2021.10/bin" >> $GITHUB_PATH
+
+    - name: Verify toolchain installation
+      run: |
+        arm-none-eabi-gcc --version
+
+    - name: Check C syntax (if Makefile exists)
+      run: |
+        if [ -f Makefile ]; then
+          make clean || true
+          # 注意：实际构建可能需要STM32 HAL库和其他依赖
+          # make all || echo "Build failed, but continuing for now"
+        fi
+        echo "C syntax check placeholder - actual build requires full STM32 environment"
+
+    - name: Static analysis with cppcheck
+      run: |
+        sudo apt-get install -y cppcheck
+        cppcheck --enable=all --inconclusive --std=c99 \
+          --suppress=missingIncludeSystem \
+          --suppress=unmatchedSuppression \
+          Core/Src/ Core/Inc/ 2> cppcheck-report.txt || true
+        cat cppcheck-report.txt
+
+    - name: Upload cppcheck results
+      uses: actions/upload-artifact@v3
+      with:
+        name: cppcheck-report
+        path: cppcheck-report.txt

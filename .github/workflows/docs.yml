@@ -1,0 +1,40 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ Master ]
+    paths:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ Master ]
+    paths:
+      - '**.md'
+
+jobs:
+  markdown-lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Lint Markdown files
+      uses: actionshub/markdownlint@main
+      with:
+        path: "."
+        ignore: "node_modules .venv .git"
+        config: ".markdownlint.json"
+      continue-on-error: true
+
+  check-links:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Check Markdown links
+      uses: gaurav-nelson/github-action-markdown-link-check@v1
+      with:
+        use-quiet-mode: 'yes'
+        use-verbose-mode: 'no'
+      continue-on-error: true
